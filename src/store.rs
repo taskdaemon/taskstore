@@ -991,6 +991,168 @@ impl Store {
 
         Ok(execs)
     }
+
+    // ===== Git Integration =====
+
+    /// Install git hooks for automatic sync
+    pub fn install_git_hooks(&self) -> Result<()> {
+        info!("Installing git hooks");
+
+        // Find git directory
+        let git_dir = self.find_git_dir()?;
+        let hooks_dir = git_dir.join("hooks");
+
+        // Create hooks directory if it doesn't exist
+        fs::create_dir_all(&hooks_dir).context("Failed to create hooks directory")?;
+
+        // Install all hooks
+        self.install_hook(&hooks_dir, "pre-commit", "taskstore sync")?;
+        self.install_hook(&hooks_dir, "post-merge", "taskstore sync")?;
+        self.install_hook(&hooks_dir, "post-rebase", "taskstore sync")?;
+        self.install_hook(&hooks_dir, "pre-push", "taskstore sync")?;
+        self.install_hook(&hooks_dir, "post-checkout", "taskstore sync")?;
+
+        // Install .gitattributes for merge driver
+        self.install_gitattributes()?;
+
+        info!("Git hooks installed successfully");
+        Ok(())
+    }
+
+    /// Find the .git directory (handles worktrees)
+    fn find_git_dir(&self) -> Result<PathBuf> {
+        let mut current = self.base_path.clone();
+
+        // Walk up to find .git
+        loop {
+            let git_path = current.join(".git");
+            if git_path.exists() {
+                if git_path.is_dir() {
+                    return Ok(git_path);
+                } else if git_path.is_file() {
+                    // Worktree - read gitdir from file
+                    let content = fs::read_to_string(&git_path)?;
+                    for line in content.lines() {
+                        if line.starts_with("gitdir: ") {
+                            let gitdir = line.strip_prefix("gitdir: ").unwrap();
+                            return Ok(PathBuf::from(gitdir));
+                        }
+                    }
+                }
+            }
+
+            if !current.pop() {
+                break;
+            }
+        }
+
+        Err(eyre!("Not in a git repository"))
+    }
+
+    /// Install a single hook
+    fn install_hook(&self, hooks_dir: &Path, hook_name: &str, command: &str) -> Result<()> {
+        let hook_path = hooks_dir.join(hook_name);
+        let hook_marker = "# taskstore-hook";
+
+        // Check if hook exists and already has our content
+        if hook_path.exists() {
+            let existing = fs::read_to_string(&hook_path)?;
+            if existing.contains(hook_marker) {
+                info!(hook = hook_name, "Hook already installed");
+                return Ok(());
+            }
+
+            // Append to existing hook
+            let mut file = fs::OpenOptions::new().append(true).open(&hook_path)?;
+            use std::io::Write;
+            writeln!(file, "\n{}", hook_marker)?;
+            writeln!(file, "{} || echo 'taskstore sync failed (non-fatal)'", command)?;
+        } else {
+            // Create new hook
+            let content = format!(
+                "#!/bin/bash\n{}\n{} || echo 'taskstore sync failed (non-fatal)'\n",
+                hook_marker, command
+            );
+            fs::write(&hook_path, content)?;
+
+            // Make executable
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = fs::metadata(&hook_path)?.permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(&hook_path, perms)?;
+            }
+        }
+
+        info!(hook = hook_name, "Hook installed");
+        Ok(())
+    }
+
+    /// Install .gitattributes for merge driver
+    fn install_gitattributes(&self) -> Result<()> {
+        // Find repo root
+        let mut repo_root = self.base_path.clone();
+        while !repo_root.join(".git").exists() && repo_root.pop() {}
+
+        let gitattributes_path = repo_root.join(".gitattributes");
+        let merge_rule = ".taskstore/*.jsonl merge=taskstore-merge";
+
+        if gitattributes_path.exists() {
+            let existing = fs::read_to_string(&gitattributes_path)?;
+            if existing.contains(merge_rule) {
+                info!(".gitattributes already configured");
+                return Ok(());
+            }
+
+            // Append rule
+            let mut file = fs::OpenOptions::new().append(true).open(&gitattributes_path)?;
+            use std::io::Write;
+            writeln!(file, "\n{}", merge_rule)?;
+        } else {
+            // Create new
+            fs::write(&gitattributes_path, format!("{}\n", merge_rule))?;
+        }
+
+        // Configure git merge driver
+        self.configure_merge_driver()?;
+
+        info!(".gitattributes configured");
+        Ok(())
+    }
+
+    /// Configure git merge driver
+    fn configure_merge_driver(&self) -> Result<()> {
+        use std::process::Command;
+
+        let output = Command::new("git")
+            .args([
+                "config",
+                "--local",
+                "merge.taskstore-merge.name",
+                "TaskStore JSONL merge driver",
+            ])
+            .output()?;
+
+        if !output.status.success() {
+            warn!("Failed to set merge driver name (non-fatal)");
+        }
+
+        let output = Command::new("git")
+            .args([
+                "config",
+                "--local",
+                "merge.taskstore-merge.driver",
+                "taskstore-merge %O %A %B",
+            ])
+            .output()?;
+
+        if !output.status.success() {
+            warn!("Failed to set merge driver command (non-fatal)");
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
