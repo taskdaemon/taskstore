@@ -123,6 +123,42 @@ pub fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+// Display implementations for status enums
+impl std::fmt::Display for PrdStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PrdStatus::Draft => write!(f, "draft"),
+            PrdStatus::Ready => write!(f, "ready"),
+            PrdStatus::Active => write!(f, "active"),
+            PrdStatus::Complete => write!(f, "complete"),
+            PrdStatus::Cancelled => write!(f, "cancelled"),
+        }
+    }
+}
+
+impl std::fmt::Display for TaskSpecStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TaskSpecStatus::Pending => write!(f, "pending"),
+            TaskSpecStatus::Running => write!(f, "running"),
+            TaskSpecStatus::Complete => write!(f, "complete"),
+            TaskSpecStatus::Failed => write!(f, "failed"),
+        }
+    }
+}
+
+impl std::fmt::Display for ExecStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExecStatus::Running => write!(f, "running"),
+            ExecStatus::Paused => write!(f, "paused"),
+            ExecStatus::Complete => write!(f, "complete"),
+            ExecStatus::Failed => write!(f, "failed"),
+            ExecStatus::Stopped => write!(f, "stopped"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
