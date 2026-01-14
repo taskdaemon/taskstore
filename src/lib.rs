@@ -1,5 +1,6 @@
 // TaskStore library - Persistent state management with SQLite+JSONL+Git
 
+pub mod jsonl;
 pub mod models;
 pub mod store;
 

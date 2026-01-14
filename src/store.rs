@@ -41,11 +41,11 @@ impl Store {
         let mut store = Self { db, base_path };
 
         // Check and handle schema version
-        store.ensure_schema()?;
+        let schema_was_recreated = store.ensure_schema()?;
 
-        // Check if sync is needed
-        if store.is_stale()? {
-            info!("Store is stale, syncing from JSONL");
+        // Check if sync is needed (or force sync if schema was recreated)
+        if schema_was_recreated || store.is_stale()? {
+            info!("Store is stale or schema was recreated, syncing from JSONL");
             store.sync()?;
         }
 
@@ -59,8 +59,19 @@ impl Store {
     }
 
     /// Ensure schema is initialized and up to date
-    fn ensure_schema(&mut self) -> Result<()> {
+    /// Returns true if schema was recreated (requires sync)
+    fn ensure_schema(&mut self) -> Result<bool> {
         let version_file = self.base_path.join(".version");
+
+        // Check if schema actually exists in database
+        let schema_exists = self
+            .db
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='prds'",
+                [],
+                |_| Ok(()),
+            )
+            .is_ok();
 
         let current_version = if version_file.exists() {
             fs::read_to_string(&version_file)
@@ -71,6 +82,13 @@ impl Store {
         } else {
             0
         };
+
+        // If schema doesn't exist but version file does, we need to recreate
+        if !schema_exists && current_version > 0 {
+            info!("Schema missing but version file exists, recreating schema");
+            self.create_schema()?;
+            return Ok(true); // Schema was recreated, needs sync
+        }
 
         if current_version == 0 {
             // Fresh install, initialize schema
@@ -90,7 +108,7 @@ impl Store {
             ));
         }
 
-        Ok(())
+        Ok(false) // Schema was not recreated
     }
 
     /// Create initial schema
@@ -228,11 +246,162 @@ impl Store {
         Ok(false)
     }
 
-    /// Sync: Rebuild SQLite from JSONL if needed
+    /// Sync: Rebuild SQLite from JSONL files
     pub fn sync(&mut self) -> Result<()> {
+        use crate::jsonl::read_jsonl_latest;
+        use crate::models::{Dependency, Execution, Prd, PrdStatus, RepoState, TaskSpec, TaskSpecStatus, Workflow};
+
         info!("Syncing store from JSONL files");
-        // Implementation will be in Phase 3
-        // For now, just a placeholder
+
+        // Clear existing data
+        self.db.execute("DELETE FROM dependencies", [])?;
+        self.db.execute("DELETE FROM executions", [])?;
+        self.db.execute("DELETE FROM task_specs", [])?;
+        self.db.execute("DELETE FROM prds", [])?;
+        self.db.execute("DELETE FROM workflows", [])?;
+        self.db.execute("DELETE FROM repo_state", [])?;
+
+        // Rebuild from JSONL files
+        let prds: std::collections::HashMap<String, Prd> = read_jsonl_latest(&self.base_path.join("prds.jsonl"))?;
+        for prd in prds.values() {
+            let status_str = match prd.status {
+                PrdStatus::Draft => "draft",
+                PrdStatus::Ready => "ready",
+                PrdStatus::Active => "active",
+                PrdStatus::Complete => "complete",
+                PrdStatus::Cancelled => "cancelled",
+            };
+            self.db.execute(
+                "INSERT INTO prds (id, title, description, created_at, updated_at, status, review_passes, content)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (
+                    &prd.id,
+                    &prd.title,
+                    &prd.description,
+                    prd.created_at,
+                    prd.updated_at,
+                    status_str,
+                    prd.review_passes,
+                    &prd.content,
+                ),
+            )?;
+        }
+
+        let task_specs: std::collections::HashMap<String, TaskSpec> =
+            read_jsonl_latest(&self.base_path.join("task_specs.jsonl"))?;
+        for ts in task_specs.values() {
+            let status_str = match ts.status {
+                TaskSpecStatus::Pending => "pending",
+                TaskSpecStatus::Running => "running",
+                TaskSpecStatus::Complete => "complete",
+                TaskSpecStatus::Failed => "failed",
+            };
+            self.db.execute(
+                "INSERT INTO task_specs (id, prd_id, phase_name, description, created_at, updated_at,
+                                        status, workflow_name, assigned_to, content)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                (
+                    &ts.id,
+                    &ts.prd_id,
+                    &ts.phase_name,
+                    &ts.description,
+                    ts.created_at,
+                    ts.updated_at,
+                    status_str,
+                    &ts.workflow_name,
+                    &ts.assigned_to,
+                    &ts.content,
+                ),
+            )?;
+        }
+
+        let executions: std::collections::HashMap<String, Execution> =
+            read_jsonl_latest(&self.base_path.join("executions.jsonl"))?;
+        for exec in executions.values() {
+            let status_str = match exec.status {
+                crate::models::ExecStatus::Running => "running",
+                crate::models::ExecStatus::Paused => "paused",
+                crate::models::ExecStatus::Complete => "complete",
+                crate::models::ExecStatus::Failed => "failed",
+                crate::models::ExecStatus::Stopped => "stopped",
+            };
+            self.db.execute(
+                "INSERT INTO executions (id, ts_id, worktree_path, branch_name, status, started_at,
+                                        updated_at, completed_at, current_phase, iteration_count, error_message)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                (
+                    &exec.id,
+                    &exec.ts_id,
+                    &exec.worktree_path,
+                    &exec.branch_name,
+                    status_str,
+                    exec.started_at,
+                    exec.updated_at,
+                    exec.completed_at,
+                    &exec.current_phase,
+                    exec.iteration_count,
+                    &exec.error_message,
+                ),
+            )?;
+        }
+
+        let dependencies: std::collections::HashMap<String, Dependency> =
+            read_jsonl_latest(&self.base_path.join("dependencies.jsonl"))?;
+        for dep in dependencies.values() {
+            let type_str = match dep.dependency_type {
+                crate::models::DependencyType::Notify => "notify",
+                crate::models::DependencyType::Query => "query",
+                crate::models::DependencyType::Share => "share",
+            };
+            self.db.execute(
+                "INSERT INTO dependencies (id, from_exec_id, to_exec_id, dependency_type, created_at, resolved_at, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (
+                    &dep.id,
+                    &dep.from_exec_id,
+                    &dep.to_exec_id,
+                    type_str,
+                    dep.created_at,
+                    dep.resolved_at,
+                    &dep.payload,
+                ),
+            )?;
+        }
+
+        let workflows: std::collections::HashMap<String, Workflow> =
+            read_jsonl_latest(&self.base_path.join("workflows.jsonl"))?;
+        for workflow in workflows.values() {
+            self.db.execute(
+                "INSERT INTO workflows (id, name, version, created_at, updated_at, content)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (
+                    &workflow.id,
+                    &workflow.name,
+                    &workflow.version,
+                    workflow.created_at,
+                    workflow.updated_at,
+                    &workflow.content,
+                ),
+            )?;
+        }
+
+        let repo_states: std::collections::HashMap<String, RepoState> =
+            read_jsonl_latest(&self.base_path.join("repo_state.jsonl"))?;
+        for state in repo_states.values() {
+            self.db.execute(
+                "INSERT INTO repo_state (repo_path, last_synced_commit, updated_at)
+                 VALUES (?1, ?2, ?3)",
+                (&state.repo_path, &state.last_synced_commit, state.updated_at),
+            )?;
+        }
+
+        info!(
+            prds = prds.len(),
+            task_specs = task_specs.len(),
+            executions = executions.len(),
+            "Sync complete"
+        );
+
         Ok(())
     }
 
@@ -247,7 +416,14 @@ impl Store {
 
     /// Create a new PRD
     pub fn create_prd(&mut self, prd: crate::models::Prd) -> Result<String> {
+        use crate::jsonl::append_jsonl;
         use crate::models::PrdStatus;
+
+        // Write to JSONL first (source of truth)
+        let jsonl_path = self.base_path.join("prds.jsonl");
+        append_jsonl(&jsonl_path, &prd)?;
+
+        // Then write to SQLite (cache)
         let status_str = match prd.status {
             PrdStatus::Draft => "draft",
             PrdStatus::Ready => "ready",
@@ -314,7 +490,14 @@ impl Store {
 
     /// Update an existing PRD
     pub fn update_prd(&mut self, id: &str, prd: crate::models::Prd) -> Result<()> {
+        use crate::jsonl::append_jsonl;
         use crate::models::PrdStatus;
+
+        // Write to JSONL first (source of truth)
+        let jsonl_path = self.base_path.join("prds.jsonl");
+        append_jsonl(&jsonl_path, &prd)?;
+
+        // Then update SQLite (cache)
         let status_str = match prd.status {
             PrdStatus::Draft => "draft",
             PrdStatus::Ready => "ready",
@@ -400,7 +583,14 @@ impl Store {
 
     /// Create a new TaskSpec
     pub fn create_task_spec(&mut self, ts: crate::models::TaskSpec) -> Result<String> {
+        use crate::jsonl::append_jsonl;
         use crate::models::TaskSpecStatus;
+
+        // Write to JSONL first
+        let jsonl_path = self.base_path.join("task_specs.jsonl");
+        append_jsonl(&jsonl_path, &ts)?;
+
+        // Then SQLite
         let status_str = match ts.status {
             TaskSpecStatus::Pending => "pending",
             TaskSpecStatus::Running => "running",
@@ -471,7 +661,14 @@ impl Store {
 
     /// Update an existing TaskSpec
     pub fn update_task_spec(&mut self, id: &str, ts: crate::models::TaskSpec) -> Result<()> {
+        use crate::jsonl::append_jsonl;
         use crate::models::TaskSpecStatus;
+
+        // Write to JSONL first
+        let jsonl_path = self.base_path.join("task_specs.jsonl");
+        append_jsonl(&jsonl_path, &ts)?;
+
+        // Then SQLite
         let status_str = match ts.status {
             TaskSpecStatus::Pending => "pending",
             TaskSpecStatus::Running => "running",
@@ -576,7 +773,14 @@ impl Store {
 
     /// Create a new Execution
     pub fn create_execution(&mut self, exec: crate::models::Execution) -> Result<String> {
+        use crate::jsonl::append_jsonl;
         use crate::models::ExecStatus;
+
+        // Write to JSONL first
+        let jsonl_path = self.base_path.join("executions.jsonl");
+        append_jsonl(&jsonl_path, &exec)?;
+
+        // Then SQLite
         let status_str = match exec.status {
             ExecStatus::Running => "running",
             ExecStatus::Paused => "paused",
@@ -651,7 +855,14 @@ impl Store {
 
     /// Update an existing Execution
     pub fn update_execution(&mut self, id: &str, exec: crate::models::Execution) -> Result<()> {
+        use crate::jsonl::append_jsonl;
         use crate::models::ExecStatus;
+
+        // Write to JSONL first
+        let jsonl_path = self.base_path.join("executions.jsonl");
+        append_jsonl(&jsonl_path, &exec)?;
+
+        // Then SQLite
         let status_str = match exec.status {
             ExecStatus::Running => "running",
             ExecStatus::Paused => "paused",
@@ -1064,5 +1275,124 @@ mod tests {
         let result = store.update_prd("nonexistent", prd);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("PRD not found"));
+    }
+
+    #[test]
+    fn test_jsonl_write_through() {
+        use crate::models::{Prd, PrdStatus, now_ms};
+        let temp = TempDir::new().unwrap();
+        let store_path = temp.path().join(".taskstore");
+        let mut store = Store::open(&store_path).unwrap();
+
+        // Create PRD
+        let prd = Prd {
+            id: "test-1".to_string(),
+            title: "Test PRD".to_string(),
+            description: "Test".to_string(),
+            created_at: now_ms(),
+            updated_at: now_ms(),
+            status: PrdStatus::Draft,
+            review_passes: 0,
+            content: "content".to_string(),
+        };
+        store.create_prd(prd).unwrap();
+
+        // Verify JSONL file was created
+        let jsonl_path = store_path.join("prds.jsonl");
+        assert!(jsonl_path.exists());
+
+        // Verify content was written
+        let content = fs::read_to_string(&jsonl_path).unwrap();
+        assert!(content.contains("test-1"));
+        assert!(content.contains("Test PRD"));
+    }
+
+    #[test]
+    fn test_sync_rebuilds_from_jsonl() {
+        use crate::models::{Prd, PrdStatus};
+        let temp = TempDir::new().unwrap();
+        let store_path = temp.path().join(".taskstore");
+
+        // Create and populate store
+        {
+            let mut store = Store::open(&store_path).unwrap();
+
+            let prd1 = Prd {
+                id: "test-1".to_string(),
+                title: "PRD 1".to_string(),
+                description: "Test".to_string(),
+                created_at: 1000,
+                updated_at: 1000,
+                status: PrdStatus::Draft,
+                review_passes: 0,
+                content: "content1".to_string(),
+            };
+            store.create_prd(prd1).unwrap();
+
+            // Update the PRD (creates new JSONL entry)
+            let prd2 = Prd {
+                id: "test-1".to_string(),
+                title: "PRD 1 Updated".to_string(),
+                description: "Test".to_string(),
+                created_at: 1000,
+                updated_at: 2000, // Newer timestamp
+                status: PrdStatus::Active,
+                review_passes: 5,
+                content: "content2".to_string(),
+            };
+            store.update_prd("test-1", prd2).unwrap();
+        }
+
+        // Delete SQLite database to simulate stale state
+        fs::remove_file(store_path.join("taskstore.db")).unwrap();
+
+        // Reopen store, should trigger sync
+        {
+            let store = Store::open(&store_path).unwrap();
+
+            // Verify latest version was restored
+            let prd = store.get_prd("test-1").unwrap().unwrap();
+            assert_eq!(prd.title, "PRD 1 Updated");
+            assert_eq!(prd.updated_at, 2000);
+            assert_eq!(prd.status, PrdStatus::Active);
+            assert_eq!(prd.review_passes, 5);
+        }
+    }
+
+    #[test]
+    fn test_sync_handles_multiple_records() {
+        use crate::models::{Prd, PrdStatus, now_ms};
+        let temp = TempDir::new().unwrap();
+        let store_path = temp.path().join(".taskstore");
+
+        // Create multiple records
+        {
+            let mut store = Store::open(&store_path).unwrap();
+
+            for i in 1..=5 {
+                let prd = Prd {
+                    id: format!("test-{}", i),
+                    title: format!("PRD {}", i),
+                    description: "Test".to_string(),
+                    created_at: now_ms(),
+                    updated_at: now_ms(),
+                    status: PrdStatus::Draft,
+                    review_passes: 0,
+                    content: "content".to_string(),
+                };
+                store.create_prd(prd).unwrap();
+            }
+        }
+
+        // Delete SQLite and reopen
+        fs::remove_file(store_path.join("taskstore.db")).unwrap();
+
+        {
+            let store = Store::open(&store_path).unwrap();
+
+            // Verify all records restored
+            let prds = store.list_prds(None).unwrap();
+            assert_eq!(prds.len(), 5);
+        }
     }
 }
