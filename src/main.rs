@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use colored::*;
 use eyre::{Context, Result};
 use std::path::PathBuf;
-use taskstore::{Store, PrdStatus, TaskSpecStatus, ExecStatus};
+use taskstore::{ExecStatus, PrdStatus, Store, TaskSpecStatus};
 
 #[derive(Parser)]
 #[command(name = "taskstore")]
@@ -68,8 +68,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Open store
-    let mut store = Store::open(&cli.store_path)
-        .context("Failed to open store")?;
+    let mut store = Store::open(&cli.store_path).context("Failed to open store")?;
 
     match cli.command {
         Commands::ListPrds { status } => {
@@ -112,7 +111,10 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            println!("{}", format!("Found {} task spec(s) for PRD '{}'", specs.len(), prd_id).cyan());
+            println!(
+                "{}",
+                format!("Found {} task spec(s) for PRD '{}'", specs.len(), prd_id).cyan()
+            );
             println!();
             println!("{:<20} {:<30} {:<20} {:<15}", "ID", "Phase", "PRD ID", "Status");
             println!("{}", "-".repeat(85));
@@ -145,7 +147,10 @@ fn main() -> Result<()> {
 
             println!("{}", format!("Found {} execution(s)", executions.len()).cyan());
             println!();
-            println!("{:<20} {:<30} {:<15} {:<20}", "ID", "Task Spec ID", "Status", "Started At");
+            println!(
+                "{:<20} {:<30} {:<15} {:<20}",
+                "ID", "Task Spec ID", "Status", "Started At"
+            );
             println!("{}", "-".repeat(85));
 
             for exec in executions {
@@ -166,85 +171,86 @@ fn main() -> Result<()> {
             }
         }
 
-        Commands::Show { record_type, id } => {
-            match record_type.as_str() {
-                "prd" => {
-                    if let Some(prd) = store.get_prd(&id)? {
-                        println!("{}", "PRD Details".cyan().bold());
-                        println!("{}", "=".repeat(80));
-                        println!("{:<15} {}", "ID:", prd.id);
-                        println!("{:<15} {}", "Title:", prd.title);
-                        println!("{:<15} {}", "Description:", prd.description);
-                        println!("{:<15} {}", "Status:", format_prd_status(prd.status));
-                        println!("{:<15} {}", "Review Passes:", prd.review_passes);
-                        println!("{:<15} {}", "Created At:", format_timestamp(prd.created_at));
-                        println!("{:<15} {}", "Updated At:", format_timestamp(prd.updated_at));
-                        println!();
-                        println!("{}", "Content:".cyan());
-                        println!("{}", "-".repeat(80));
-                        println!("{}", prd.content);
-                    } else {
-                        println!("{}", format!("PRD '{}' not found", id).red());
-                    }
-                }
-                "ts" => {
-                    if let Some(spec) = store.get_task_spec(&id)? {
-                        println!("{}", "Task Spec Details".cyan().bold());
-                        println!("{}", "=".repeat(80));
-                        println!("{:<15} {}", "ID:", spec.id);
-                        println!("{:<15} {}", "Phase:", spec.phase_name);
-                        println!("{:<15} {}", "Description:", spec.description);
-                        println!("{:<15} {}", "PRD ID:", spec.prd_id);
-                        println!("{:<15} {}", "Status:", format_task_spec_status(spec.status));
-                        if let Some(workflow) = &spec.workflow_name {
-                            println!("{:<15} {}", "Workflow:", workflow);
-                        }
-                        if let Some(assigned) = &spec.assigned_to {
-                            println!("{:<15} {}", "Assigned To:", assigned);
-                        }
-                        println!("{:<15} {}", "Created At:", format_timestamp(spec.created_at));
-                        println!("{:<15} {}", "Updated At:", format_timestamp(spec.updated_at));
-                        println!();
-                        println!("{}", "Content:".cyan());
-                        println!("{}", "-".repeat(80));
-                        println!("{}", spec.content);
-                    } else {
-                        println!("{}", format!("Task spec '{}' not found", id).red());
-                    }
-                }
-                "execution" => {
-                    if let Some(exec) = store.get_execution(&id)? {
-                        println!("{}", "Execution Details".cyan().bold());
-                        println!("{}", "=".repeat(80));
-                        println!("{:<15} {}", "ID:", exec.id);
-                        println!("{:<15} {}", "Task Spec ID:", exec.ts_id);
-                        println!("{:<15} {}", "Worktree Path:", exec.worktree_path);
-                        println!("{:<15} {}", "Branch Name:", exec.branch_name);
-                        println!("{:<15} {}", "Status:", format_exec_status(exec.status));
-                        println!("{:<15} {}", "Started At:", format_timestamp(exec.started_at));
-                        println!("{:<15} {}", "Updated At:", format_timestamp(exec.updated_at));
-                        if let Some(completed_at) = exec.completed_at {
-                            println!("{:<15} {}", "Completed At:", format_timestamp(completed_at));
-                        }
-                        if let Some(phase) = &exec.current_phase {
-                            println!("{:<15} {}", "Current Phase:", phase);
-                        }
-                        println!("{:<15} {}", "Iteration Count:", exec.iteration_count);
-                        if let Some(error) = &exec.error_message {
-                            println!();
-                            println!("{}", "Error Message:".red());
-                            println!("{}", "-".repeat(80));
-                            println!("{}", error);
-                        }
-                    } else {
-                        println!("{}", format!("Execution '{}' not found", id).red());
-                    }
-                }
-                _ => {
-                    println!("{}", format!("Unknown record type '{}'. Valid types: prd, ts, execution", record_type).red());
+        Commands::Show { record_type, id } => match record_type.as_str() {
+            "prd" => {
+                if let Some(prd) = store.get_prd(&id)? {
+                    println!("{}", "PRD Details".cyan().bold());
+                    println!("{}", "=".repeat(80));
+                    println!("{:<15} {}", "ID:", prd.id);
+                    println!("{:<15} {}", "Title:", prd.title);
+                    println!("{:<15} {}", "Description:", prd.description);
+                    println!("{:<15} {}", "Status:", format_prd_status(prd.status));
+                    println!("{:<15} {}", "Review Passes:", prd.review_passes);
+                    println!("{:<15} {}", "Created At:", format_timestamp(prd.created_at));
+                    println!("{:<15} {}", "Updated At:", format_timestamp(prd.updated_at));
+                    println!();
+                    println!("{}", "Content:".cyan());
+                    println!("{}", "-".repeat(80));
+                    println!("{}", prd.content);
+                } else {
+                    println!("{}", format!("PRD '{}' not found", id).red());
                 }
             }
-        }
+            "ts" => {
+                if let Some(spec) = store.get_task_spec(&id)? {
+                    println!("{}", "Task Spec Details".cyan().bold());
+                    println!("{}", "=".repeat(80));
+                    println!("{:<15} {}", "ID:", spec.id);
+                    println!("{:<15} {}", "Phase:", spec.phase_name);
+                    println!("{:<15} {}", "Description:", spec.description);
+                    println!("{:<15} {}", "PRD ID:", spec.prd_id);
+                    println!("{:<15} {}", "Status:", format_task_spec_status(spec.status));
+                    if let Some(workflow) = &spec.workflow_name {
+                        println!("{:<15} {}", "Workflow:", workflow);
+                    }
+                    if let Some(assigned) = &spec.assigned_to {
+                        println!("{:<15} {}", "Assigned To:", assigned);
+                    }
+                    println!("{:<15} {}", "Created At:", format_timestamp(spec.created_at));
+                    println!("{:<15} {}", "Updated At:", format_timestamp(spec.updated_at));
+                    println!();
+                    println!("{}", "Content:".cyan());
+                    println!("{}", "-".repeat(80));
+                    println!("{}", spec.content);
+                } else {
+                    println!("{}", format!("Task spec '{}' not found", id).red());
+                }
+            }
+            "execution" => {
+                if let Some(exec) = store.get_execution(&id)? {
+                    println!("{}", "Execution Details".cyan().bold());
+                    println!("{}", "=".repeat(80));
+                    println!("{:<15} {}", "ID:", exec.id);
+                    println!("{:<15} {}", "Task Spec ID:", exec.ts_id);
+                    println!("{:<15} {}", "Worktree Path:", exec.worktree_path);
+                    println!("{:<15} {}", "Branch Name:", exec.branch_name);
+                    println!("{:<15} {}", "Status:", format_exec_status(exec.status));
+                    println!("{:<15} {}", "Started At:", format_timestamp(exec.started_at));
+                    println!("{:<15} {}", "Updated At:", format_timestamp(exec.updated_at));
+                    if let Some(completed_at) = exec.completed_at {
+                        println!("{:<15} {}", "Completed At:", format_timestamp(completed_at));
+                    }
+                    if let Some(phase) = &exec.current_phase {
+                        println!("{:<15} {}", "Current Phase:", phase);
+                    }
+                    println!("{:<15} {}", "Iteration Count:", exec.iteration_count);
+                    if let Some(error) = &exec.error_message {
+                        println!();
+                        println!("{}", "Error Message:".red());
+                        println!("{}", "-".repeat(80));
+                        println!("{}", error);
+                    }
+                } else {
+                    println!("{}", format!("Execution '{}' not found", id).red());
+                }
+            }
+            _ => {
+                println!(
+                    "{}",
+                    format!("Unknown record type '{}'. Valid types: prd, ts, execution", record_type).red()
+                );
+            }
+        },
 
         Commands::Sync => {
             println!("{}", "Syncing SQLite from JSONL files...".cyan());
@@ -274,7 +280,13 @@ fn main() -> Result<()> {
             // PRD status breakdown
             if !all_prds.is_empty() {
                 println!("{}", "PRD Status Breakdown:".cyan());
-                for status in [PrdStatus::Draft, PrdStatus::Ready, PrdStatus::Active, PrdStatus::Complete, PrdStatus::Cancelled] {
+                for status in [
+                    PrdStatus::Draft,
+                    PrdStatus::Ready,
+                    PrdStatus::Active,
+                    PrdStatus::Complete,
+                    PrdStatus::Cancelled,
+                ] {
                     let count = all_prds.iter().filter(|p| p.status == status).count();
                     if count > 0 {
                         println!("  {:<12} {}", format!("{}:", status), count);
