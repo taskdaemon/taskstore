@@ -1,6 +1,7 @@
 // JSONL file operations
 
 use eyre::{Context, Result};
+use fs2::FileExt;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -17,10 +18,14 @@ pub fn append_jsonl<T: Serialize>(path: &Path, record: &T) -> Result<()> {
         .open(path)
         .context("Failed to open JSONL file for appending")?;
 
+    // Acquire exclusive lock before writing
+    file.lock_exclusive().context("Failed to acquire file lock")?;
+
     let json = serde_json::to_string(record)?;
     writeln!(file, "{}", json)?;
     file.sync_all()?; // Ensure data is flushed to disk
 
+    // Lock is automatically released when file is dropped
     Ok(())
 }
 
@@ -35,6 +40,10 @@ pub fn read_jsonl_latest(path: &Path) -> Result<HashMap<String, Value>> {
     }
 
     let file = File::open(path).context("Failed to open JSONL file")?;
+
+    // Acquire shared lock to allow concurrent reads while blocking writes
+    file.lock_shared().context("Failed to acquire shared file lock")?;
+
     let reader = BufReader::new(file);
     let mut records: HashMap<String, Value> = HashMap::new();
 

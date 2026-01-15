@@ -4,11 +4,12 @@ use crate::filter::Filter;
 use crate::jsonl;
 use crate::record::{IndexValue, Record};
 use eyre::{Context, Result, eyre};
+use fs2::FileExt;
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 const CURRENT_VERSION: u32 = 1;
 
@@ -91,6 +92,13 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_record_indexes_field_str ON record_indexes(collection, field_name, field_value_str);
             CREATE INDEX IF NOT EXISTS idx_record_indexes_field_int ON record_indexes(collection, field_name, field_value_int);
             CREATE INDEX IF NOT EXISTS idx_record_indexes_field_bool ON record_indexes(collection, field_name, field_value_bool);
+
+            -- Sync metadata for staleness detection
+            CREATE TABLE IF NOT EXISTS sync_metadata (
+                collection TEXT PRIMARY KEY,
+                last_sync_time INTEGER NOT NULL,
+                file_mtime INTEGER NOT NULL
+            );
             "#,
         )?;
 
@@ -119,29 +127,50 @@ impl Store {
     }
 
     /// Check if database needs syncing from JSONL
+    ///
+    /// Returns true if any JSONL file has been modified since the last sync,
+    /// or if there are JSONL files that have never been synced.
     pub fn is_stale(&self) -> Result<bool> {
-        // Check if any JSONL files exist
-        let jsonl_files: Vec<_> = fs::read_dir(&self.base_path)?
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s == "jsonl")
-                    .unwrap_or(false)
-            })
-            .collect();
+        // Check each JSONL file
+        for entry in fs::read_dir(&self.base_path)? {
+            let entry = entry?;
+            let path = entry.path();
 
-        if jsonl_files.is_empty() {
-            return Ok(false);
+            if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                continue;
+            }
+
+            let collection = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            // Get file modification time
+            let metadata = fs::metadata(&path)?;
+            let file_mtime = metadata
+                .modified()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+
+            // Check if we have sync metadata for this collection
+            let stored_mtime: Option<i64> = self
+                .db
+                .query_row(
+                    "SELECT file_mtime FROM sync_metadata WHERE collection = ?1",
+                    [collection],
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            match stored_mtime {
+                None => return Ok(true),                              // Never synced
+                Some(mtime) if file_mtime > mtime => return Ok(true), // File modified
+                _ => continue,
+            }
         }
 
-        // Check if records table is empty
-        let count: i64 = self
-            .db
-            .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))?;
-
-        Ok(count == 0)
+        Ok(false)
     }
 
     // ========================================================================
@@ -154,6 +183,7 @@ impl Store {
         Self::validate_collection_name(collection)?;
 
         let id = record.id().to_string();
+        Self::validate_id(&id)?;
 
         // 1. Append to JSONL
         self.append_jsonl_generic(collection, &record)?;
@@ -346,7 +376,6 @@ impl Store {
 
     fn append_jsonl_generic<T: Record>(&self, collection: &str, record: &T) -> Result<()> {
         let jsonl_path = self.base_path.join(format!("{}.jsonl", collection));
-        let json = serde_json::to_string(record)?;
 
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -354,16 +383,21 @@ impl Store {
             .open(&jsonl_path)
             .context("Failed to open JSONL file for appending")?;
 
+        // Acquire exclusive lock before writing
+        file.lock_exclusive().context("Failed to acquire file lock")?;
+
+        let json = serde_json::to_string(record)?;
+
         use std::io::Write;
         writeln!(file, "{}", json)?;
         file.sync_all()?;
 
+        // Lock is automatically released when file is dropped
         Ok(())
     }
 
     fn append_jsonl_raw(&self, collection: &str, value: &serde_json::Value) -> Result<()> {
         let jsonl_path = self.base_path.join(format!("{}.jsonl", collection));
-        let json = serde_json::to_string(value)?;
 
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -371,10 +405,16 @@ impl Store {
             .open(&jsonl_path)
             .context("Failed to open JSONL file for appending")?;
 
+        // Acquire exclusive lock before writing
+        file.lock_exclusive().context("Failed to acquire file lock")?;
+
+        let json = serde_json::to_string(value)?;
+
         use std::io::Write;
         writeln!(file, "{}", json)?;
         file.sync_all()?;
 
+        // Lock is automatically released when file is dropped
         Ok(())
     }
 
@@ -451,11 +491,28 @@ impl Store {
         Ok(())
     }
 
+    /// Validate record ID
+    fn validate_id(id: &str) -> Result<()> {
+        // Check not empty or whitespace-only
+        if id.trim().is_empty() {
+            return Err(eyre!("Record ID cannot be empty or whitespace-only"));
+        }
+
+        // Check reasonable length (prevent DoS via huge IDs)
+        if id.len() > 256 {
+            return Err(eyre!("Record ID too long: {} chars (max 256)", id.len()));
+        }
+
+        Ok(())
+    }
+
     // ========================================================================
     // Sync operations
     // ========================================================================
 
     /// Sync SQLite database from JSONL files
+    ///
+    /// After sync, call `rebuild_indexes::<T>()` for each record type to restore indexes.
     pub fn sync(&mut self) -> Result<()> {
         info!("Syncing database from JSONL files");
 
@@ -479,6 +536,13 @@ impl Store {
 
             debug!("Syncing collection: {}", collection);
 
+            // Get file modification time for staleness tracking
+            let file_mtime = fs::metadata(&path)?
+                .modified()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+
             // Read records from JSONL
             let records = jsonl::read_jsonl_latest(&path)?;
 
@@ -499,13 +563,82 @@ impl Store {
                 )?;
 
                 // Note: We don't restore indexes during sync since we don't know
-                // which fields were indexed. This is a limitation of the generic approach.
-                // Indexes will be rebuilt on next write operation.
+                // which fields were indexed. Call rebuild_indexes<T>() after sync.
             }
+
+            // Record sync metadata for this collection
+            self.db.execute(
+                "INSERT OR REPLACE INTO sync_metadata (collection, last_sync_time, file_mtime)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![collection, now_ms(), file_mtime],
+            )?;
         }
+
+        // Clean up orphaned sync metadata (for deleted JSONL files)
+        self.db.execute(
+            "DELETE FROM sync_metadata WHERE collection NOT IN (SELECT DISTINCT collection FROM records)",
+            [],
+        )?;
 
         info!("Sync complete");
         Ok(())
+    }
+
+    /// Rebuild indexes for a specific record type after sync
+    ///
+    /// Call this for each record type after `sync()` completes. The method:
+    /// - Reads all records from SQLite for the collection
+    /// - Deserializes each to type T to extract `indexed_fields()`
+    /// - Rebuilds the `record_indexes` table entries
+    ///
+    /// Returns the number of records successfully indexed.
+    ///
+    /// # Edge case handling
+    /// If records in the collection don't deserialize to type T (e.g., wrong type
+    /// passed), those records are skipped with a warning log. This prevents crashes
+    /// while alerting to potential misconfiguration.
+    pub fn rebuild_indexes<T: Record>(&mut self) -> Result<usize> {
+        let collection = T::collection_name();
+
+        // Get raw JSON from SQLite (bypass list<T> to handle deserialization errors)
+        // Use a block to ensure stmt is dropped before we start a transaction
+        let records_data: Vec<(String, String)> = {
+            let mut stmt = self
+                .db
+                .prepare("SELECT id, data_json FROM records WHERE collection = ?1")?;
+
+            let rows = stmt.query_map([collection], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        let tx = self.db.transaction()?;
+        let mut count = 0;
+
+        for (id, data_json) in records_data {
+            // Attempt deserialization - skip records that don't match type T
+            let record: T = match serde_json::from_str(&data_json) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        collection = collection,
+                        id = &id,
+                        error = ?e,
+                        "Skipping record that doesn't match type"
+                    );
+                    continue;
+                }
+            };
+
+            Self::update_indexes_tx(&tx, collection, &id, &record.indexed_fields())?;
+            count += 1;
+        }
+
+        tx.commit()?;
+        debug!(collection = collection, count = count, "Rebuilt indexes for collection");
+        Ok(count)
     }
 
     // ========================================================================
@@ -746,7 +879,7 @@ mod tests {
         assert_eq!(retrieved.name, "Test Record 1");
         assert_eq!(retrieved.status, "active");
         assert_eq!(retrieved.count, 42);
-        assert_eq!(retrieved.active, true);
+        assert!(retrieved.active);
     }
 
     #[test]
@@ -789,7 +922,7 @@ mod tests {
         assert_eq!(retrieved.name, "Updated");
         assert_eq!(retrieved.status, "active");
         assert_eq!(retrieved.count, 2);
-        assert_eq!(retrieved.active, true);
+        assert!(retrieved.active);
         assert_eq!(retrieved.updated_at, 2000);
     }
 
