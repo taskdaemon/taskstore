@@ -1,13 +1,11 @@
-// TaskStore library - Persistent state management with SQLite+JSONL+Git
+// TaskStore - Generic persistent state management with SQLite+JSONL+Git
 
+pub mod filter;
 pub mod jsonl;
-pub mod models;
+pub mod record;
 pub mod store;
 
 // Re-export main types for convenience
-pub use models::*;
-pub use store::Store;
-
-// Keep existing CLI/config for now (will be refactored in Phase 6)
-pub mod cli;
-pub mod config;
+pub use filter::{Filter, FilterOp};
+pub use record::{IndexValue, Record};
+pub use store::{Store, now_ms};

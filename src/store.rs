@@ -1,998 +1,516 @@
-// Core Store implementation
+// Generic store implementation using JSONL + SQLite
 
+use crate::filter::Filter;
+use crate::jsonl;
+use crate::record::{IndexValue, Record};
 use eyre::{Context, Result, eyre};
 use rusqlite::Connection;
+use rusqlite::OptionalExtension;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use tracing::{debug, info};
 
 const CURRENT_VERSION: u32 = 1;
 
-/// Main TaskStore handle
+/// Generic persistent store with SQLite cache and JSONL source of truth
 pub struct Store {
-    db: Connection,
     base_path: PathBuf,
+    db: Connection,
 }
 
 impl Store {
-    /// Open or create store at given path
+    /// Open or create a store at the given path
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let base_path = path.as_ref().to_path_buf();
+        let base_path = path.as_ref().join(".taskstore");
 
-        info!(store_path = ?base_path, "Opening TaskStore");
-
-        // Create .taskstore directory if it doesn't exist
-        fs::create_dir_all(&base_path).context("Failed to create .taskstore directory")?;
-
-        // Create .gitignore for SQLite and logs
-        let gitignore_path = base_path.join(".gitignore");
-        if !gitignore_path.exists() {
-            fs::write(&gitignore_path, "taskstore.db\ntaskstore.db-*\ntaskstore.log\n")
-                .context("Failed to create .gitignore")?;
-        }
+        // Create directory if it doesn't exist
+        fs::create_dir_all(&base_path).context("Failed to create store directory")?;
 
         // Open SQLite database
         let db_path = base_path.join("taskstore.db");
         let db = Connection::open(&db_path).context("Failed to open SQLite database")?;
 
-        // Enable WAL mode for better concurrency
-        db.execute_batch("PRAGMA journal_mode=WAL;")?;
+        let mut store = Self {
+            base_path: base_path.clone(),
+            db,
+        };
 
-        let mut store = Self { db, base_path };
+        // Initialize schema
+        store.create_schema()?;
 
-        // Check and handle schema version
-        let schema_was_recreated = store.ensure_schema()?;
+        // Write .gitignore
+        store.create_gitignore()?;
 
-        // Check if sync is needed (or force sync if schema was recreated)
-        if schema_was_recreated || store.is_stale()? {
-            info!("Store is stale or schema was recreated, syncing from JSONL");
+        // Write/check version
+        store.write_version()?;
+
+        // Sync if stale
+        if store.is_stale()? {
+            info!("Database is stale, syncing from JSONL files");
             store.sync()?;
         }
 
-        info!("TaskStore opened successfully");
         Ok(store)
     }
 
-    /// Get the base path of the store
+    /// Get the base path of this store
     pub fn base_path(&self) -> &Path {
         &self.base_path
     }
 
-    /// Ensure schema is initialized and up to date
-    /// Returns true if schema was recreated (requires sync)
-    fn ensure_schema(&mut self) -> Result<bool> {
-        let version_file = self.base_path.join(".version");
-
-        // Check if schema actually exists in database
-        let schema_exists = self
-            .db
-            .query_row(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='prds'",
-                [],
-                |_| Ok(()),
-            )
-            .is_ok();
-
-        let current_version = if version_file.exists() {
-            fs::read_to_string(&version_file)
-                .context("Failed to read .version file")?
-                .trim()
-                .parse::<u32>()
-                .unwrap_or(0)
-        } else {
-            0
-        };
-
-        // If schema doesn't exist but version file does, we need to recreate
-        if !schema_exists && current_version > 0 {
-            info!("Schema missing but version file exists, recreating schema");
-            self.create_schema()?;
-            return Ok(true); // Schema was recreated, needs sync
-        }
-
-        if current_version == 0 {
-            // Fresh install, initialize schema
-            info!("Initializing schema version {}", CURRENT_VERSION);
-            self.create_schema()?;
-            fs::write(&version_file, CURRENT_VERSION.to_string()).context("Failed to write .version file")?;
-        } else if current_version < CURRENT_VERSION {
-            // Migration needed
-            info!("Migrating schema from v{} to v{}", current_version, CURRENT_VERSION);
-            self.migrate_schema(current_version, CURRENT_VERSION)?;
-            fs::write(&version_file, CURRENT_VERSION.to_string()).context("Failed to update .version file")?;
-        } else if current_version > CURRENT_VERSION {
-            return Err(eyre!(
-                "Database version ({}) is newer than supported version ({}). Please update taskstore.",
-                current_version,
-                CURRENT_VERSION
-            ));
-        }
-
-        Ok(false) // Schema was not recreated
-    }
-
-    /// Create initial schema
+    /// Create database schema
     fn create_schema(&self) -> Result<()> {
+        debug!("Creating database schema");
+
         self.db.execute_batch(
             r#"
-            -- Product Requirements Documents
-            CREATE TABLE IF NOT EXISTS prds (
-                id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                description TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
+            -- Generic records table
+            CREATE TABLE IF NOT EXISTS records (
+                collection TEXT NOT NULL,
+                id TEXT NOT NULL,
+                data_json TEXT NOT NULL,
                 updated_at INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                review_passes INTEGER NOT NULL,
-                content TEXT NOT NULL
+                PRIMARY KEY (collection, id)
             );
 
-            -- Task Specifications
-            CREATE TABLE IF NOT EXISTS task_specs (
-                id TEXT PRIMARY KEY,
-                prd_id TEXT NOT NULL,
-                phase_name TEXT NOT NULL,
-                description TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                workflow_name TEXT,
-                assigned_to TEXT,
-                content TEXT NOT NULL,
-                FOREIGN KEY (prd_id) REFERENCES prds(id) ON DELETE CASCADE
+            CREATE INDEX IF NOT EXISTS idx_records_collection ON records(collection);
+            CREATE INDEX IF NOT EXISTS idx_records_updated_at ON records(collection, updated_at);
+
+            -- Generic indexes table (for filtering on indexed fields)
+            CREATE TABLE IF NOT EXISTS record_indexes (
+                collection TEXT NOT NULL,
+                id TEXT NOT NULL,
+                field_name TEXT NOT NULL,
+                field_value_str TEXT,
+                field_value_int INTEGER,
+                field_value_bool INTEGER,
+                PRIMARY KEY (collection, id, field_name),
+                FOREIGN KEY (collection, id) REFERENCES records(collection, id) ON DELETE CASCADE
             );
 
-            -- Execution State
-            CREATE TABLE IF NOT EXISTS executions (
-                id TEXT PRIMARY KEY,
-                ts_id TEXT NOT NULL,
-                worktree_path TEXT NOT NULL,
-                branch_name TEXT NOT NULL,
-                status TEXT NOT NULL,
-                started_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                completed_at INTEGER,
-                current_phase TEXT,
-                iteration_count INTEGER NOT NULL DEFAULT 0,
-                error_message TEXT,
-                FOREIGN KEY (ts_id) REFERENCES task_specs(id) ON DELETE CASCADE
-            );
-
-            -- Dependencies
-            CREATE TABLE IF NOT EXISTS dependencies (
-                id TEXT PRIMARY KEY,
-                from_exec_id TEXT NOT NULL,
-                to_exec_id TEXT NOT NULL,
-                dependency_type TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                resolved_at INTEGER,
-                payload TEXT,
-                FOREIGN KEY (from_exec_id) REFERENCES executions(id) ON DELETE CASCADE,
-                FOREIGN KEY (to_exec_id) REFERENCES executions(id) ON DELETE CASCADE
-            );
-
-            -- AWL Workflow Definitions
-            CREATE TABLE IF NOT EXISTS workflows (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL UNIQUE,
-                version TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                content TEXT NOT NULL
-            );
-
-            -- Repository State
-            CREATE TABLE IF NOT EXISTS repo_state (
-                repo_path TEXT PRIMARY KEY,
-                last_synced_commit TEXT NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-
-            -- Indexes for common queries
-            CREATE INDEX IF NOT EXISTS idx_prds_status ON prds(status);
-            CREATE INDEX IF NOT EXISTS idx_task_specs_prd_id ON task_specs(prd_id);
-            CREATE INDEX IF NOT EXISTS idx_task_specs_status ON task_specs(status);
-            CREATE INDEX IF NOT EXISTS idx_executions_ts_id ON executions(ts_id);
-            CREATE INDEX IF NOT EXISTS idx_executions_status ON executions(status);
-            CREATE INDEX IF NOT EXISTS idx_dependencies_from ON dependencies(from_exec_id);
-            CREATE INDEX IF NOT EXISTS idx_dependencies_to ON dependencies(to_exec_id);
-            CREATE INDEX IF NOT EXISTS idx_workflows_name ON workflows(name);
+            CREATE INDEX IF NOT EXISTS idx_record_indexes_field_str ON record_indexes(collection, field_name, field_value_str);
+            CREATE INDEX IF NOT EXISTS idx_record_indexes_field_int ON record_indexes(collection, field_name, field_value_int);
+            CREATE INDEX IF NOT EXISTS idx_record_indexes_field_bool ON record_indexes(collection, field_name, field_value_bool);
             "#,
         )?;
 
-        info!("Schema created successfully");
         Ok(())
     }
 
-    /// Migrate schema from one version to another
-    fn migrate_schema(&self, _from: u32, _to: u32) -> Result<()> {
-        // Future migrations will be implemented here
-        // For now, no migrations needed (version 1 is initial)
-        warn!("Schema migration requested but no migrations defined yet");
+    /// Create .gitignore file
+    fn create_gitignore(&self) -> Result<()> {
+        let gitignore_path = self.base_path.join(".gitignore");
+        if !gitignore_path.exists() {
+            fs::write(
+                gitignore_path,
+                "taskstore.db\ntaskstore.db-shm\ntaskstore.db-wal\ntaskstore.log\n",
+            )?;
+        }
         Ok(())
     }
 
-    /// Check if SQLite is stale compared to JSONL files
-    fn is_stale(&self) -> Result<bool> {
-        let db_path = self.base_path.join("taskstore.db");
+    /// Write version file
+    fn write_version(&self) -> Result<()> {
+        let version_path = self.base_path.join(".version");
+        if !version_path.exists() {
+            fs::write(version_path, CURRENT_VERSION.to_string())?;
+        }
+        Ok(())
+    }
 
-        // If database doesn't exist, it's stale
-        if !db_path.exists() {
-            return Ok(true);
+    /// Check if database needs syncing from JSONL
+    pub fn is_stale(&self) -> Result<bool> {
+        // Check if any JSONL files exist
+        let jsonl_files: Vec<_> = fs::read_dir(&self.base_path)?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s == "jsonl")
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        if jsonl_files.is_empty() {
+            return Ok(false);
         }
 
-        let db_mtime = fs::metadata(&db_path)?.modified()?;
+        // Check if records table is empty
+        let count: i64 = self
+            .db
+            .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))?;
 
-        // Check all JSONL files
-        let jsonl_files = vec![
-            "prds.jsonl",
-            "task_specs.jsonl",
-            "executions.jsonl",
-            "dependencies.jsonl",
-            "workflows.jsonl",
-            "repo_state.jsonl",
-        ];
+        Ok(count == 0)
+    }
 
-        for file in jsonl_files {
-            let jsonl_path = self.base_path.join(file);
-            if jsonl_path.exists() {
-                let jsonl_mtime = fs::metadata(&jsonl_path)?.modified()?;
-                if jsonl_mtime > db_mtime {
-                    return Ok(true);
+    // ========================================================================
+    // Generic CRUD API
+    // ========================================================================
+
+    /// Create a new record
+    pub fn create<T: Record>(&mut self, record: T) -> Result<String> {
+        let collection = T::collection_name();
+        Self::validate_collection_name(collection)?;
+
+        let id = record.id().to_string();
+
+        // 1. Append to JSONL
+        self.append_jsonl_generic(collection, &record)?;
+
+        // 2. Insert into SQLite with transaction
+        let tx = self.db.transaction()?;
+
+        let data_json = serde_json::to_string(&record).context("Failed to serialize record")?;
+
+        tx.execute(
+            "INSERT OR REPLACE INTO records (collection, id, data_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![collection, &id, data_json, record.updated_at()],
+        )?;
+
+        // 3. Update indexes
+        Self::update_indexes_tx(&tx, collection, &id, &record.indexed_fields())?;
+
+        tx.commit()?;
+
+        Ok(id)
+    }
+
+    /// Get a record by ID
+    pub fn get<T: Record>(&self, id: &str) -> Result<Option<T>> {
+        let collection = T::collection_name();
+
+        let mut stmt = self
+            .db
+            .prepare("SELECT data_json FROM records WHERE collection = ?1 AND id = ?2")?;
+
+        let result = stmt
+            .query_row(rusqlite::params![collection, id], |row| {
+                let json: String = row.get(0)?;
+                Ok(json)
+            })
+            .optional()?;
+
+        match result {
+            Some(json) => {
+                let record: T = serde_json::from_str(&json).context("Failed to deserialize record from database")?;
+                Ok(Some(record))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Update a record (same as create for now)
+    pub fn update<T: Record>(&mut self, record: T) -> Result<()> {
+        self.create(record)?;
+        Ok(())
+    }
+
+    /// Delete a record
+    pub fn delete<T: Record>(&mut self, id: &str) -> Result<()> {
+        let collection = T::collection_name();
+
+        // 1. Append tombstone to JSONL
+        let tombstone = serde_json::json!({
+            "id": id,
+            "deleted": true,
+            "updated_at": crate::now_ms(),
+        });
+        self.append_jsonl_raw(collection, &tombstone)?;
+
+        // 2. Delete from SQLite
+        self.db.execute(
+            "DELETE FROM records WHERE collection = ?1 AND id = ?2",
+            rusqlite::params![collection, id],
+        )?;
+
+        Ok(())
+    }
+
+    /// List records with optional filtering
+    pub fn list<T: Record>(&self, filters: &[Filter]) -> Result<Vec<T>> {
+        let collection = T::collection_name();
+
+        // If no filters, return all records
+        if filters.is_empty() {
+            let mut stmt = self
+                .db
+                .prepare("SELECT data_json FROM records WHERE collection = ?1 ORDER BY updated_at DESC")?;
+
+            let rows = stmt.query_map([collection], |row| row.get::<_, String>(0))?;
+
+            let mut results = Vec::new();
+            for row_result in rows {
+                let data_json = row_result?;
+                let record: T = serde_json::from_str(&data_json).context("Failed to deserialize record")?;
+                results.push(record);
+            }
+            return Ok(results);
+        }
+
+        // With filters: query the record_indexes table
+        let mut query = String::from(
+            "SELECT DISTINCT r.data_json
+             FROM records r
+             WHERE r.collection = ?1",
+        );
+
+        for (i, filter) in filters.iter().enumerate() {
+            Self::validate_field_name(&filter.field)?;
+
+            let join_alias = format!("idx{}", i);
+            query.push_str(&format!(
+                " AND EXISTS (
+                    SELECT 1 FROM record_indexes {}
+                    WHERE {}.collection = r.collection
+                      AND {}.id = r.id
+                      AND {}.field_name = ?{}",
+                join_alias,
+                join_alias,
+                join_alias,
+                join_alias,
+                i + 2
+            ));
+
+            // Add value comparison based on type
+            match &filter.value {
+                IndexValue::String(_) => {
+                    query.push_str(&format!(
+                        " AND {}.field_value_str {} ?{}",
+                        join_alias,
+                        filter.op.to_sql(),
+                        i + 2 + filters.len()
+                    ));
+                }
+                IndexValue::Int(_) => {
+                    query.push_str(&format!(
+                        " AND {}.field_value_int {} ?{}",
+                        join_alias,
+                        filter.op.to_sql(),
+                        i + 2 + filters.len()
+                    ));
+                }
+                IndexValue::Bool(_) => {
+                    query.push_str(&format!(
+                        " AND {}.field_value_bool {} ?{}",
+                        join_alias,
+                        filter.op.to_sql(),
+                        i + 2 + filters.len()
+                    ));
+                }
+            }
+
+            query.push(')');
+        }
+
+        query.push_str(" ORDER BY r.updated_at DESC");
+
+        let mut stmt = self.db.prepare(&query)?;
+
+        // Bind parameters: collection, then field names, then values
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        params.push(Box::new(collection.to_string()));
+
+        // Field names
+        for filter in filters {
+            params.push(Box::new(filter.field.clone()));
+        }
+
+        // Values
+        for filter in filters {
+            match &filter.value {
+                IndexValue::String(s) => params.push(Box::new(s.clone())),
+                IndexValue::Int(i) => params.push(Box::new(*i)),
+                IndexValue::Bool(b) => params.push(Box::new(*b as i64)),
+            }
+        }
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+        let rows = stmt.query_map(params_refs.as_slice(), |row| row.get::<_, String>(0))?;
+
+        let mut results = Vec::new();
+        for row_result in rows {
+            let data_json = row_result?;
+            let record: T = serde_json::from_str(&data_json).context("Failed to deserialize record")?;
+            results.push(record);
+        }
+
+        Ok(results)
+    }
+
+    // ========================================================================
+    // Helper methods
+    // ========================================================================
+
+    fn append_jsonl_generic<T: Record>(&self, collection: &str, record: &T) -> Result<()> {
+        let jsonl_path = self.base_path.join(format!("{}.jsonl", collection));
+        let json = serde_json::to_string(record)?;
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&jsonl_path)
+            .context("Failed to open JSONL file for appending")?;
+
+        use std::io::Write;
+        writeln!(file, "{}", json)?;
+        file.sync_all()?;
+
+        Ok(())
+    }
+
+    fn append_jsonl_raw(&self, collection: &str, value: &serde_json::Value) -> Result<()> {
+        let jsonl_path = self.base_path.join(format!("{}.jsonl", collection));
+        let json = serde_json::to_string(value)?;
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&jsonl_path)
+            .context("Failed to open JSONL file for appending")?;
+
+        use std::io::Write;
+        writeln!(file, "{}", json)?;
+        file.sync_all()?;
+
+        Ok(())
+    }
+
+    fn update_indexes_tx(
+        tx: &rusqlite::Transaction,
+        collection: &str,
+        id: &str,
+        fields: &std::collections::HashMap<String, IndexValue>,
+    ) -> Result<()> {
+        // Delete old indexes
+        tx.execute(
+            "DELETE FROM record_indexes WHERE collection = ?1 AND id = ?2",
+            rusqlite::params![collection, id],
+        )?;
+
+        // Insert new indexes
+        for (field_name, value) in fields {
+            Self::validate_field_name(field_name)?;
+
+            match value {
+                IndexValue::String(s) => {
+                    tx.execute(
+                        "INSERT INTO record_indexes (collection, id, field_name, field_value_str, field_value_int, field_value_bool)
+                         VALUES (?1, ?2, ?3, ?4, NULL, NULL)",
+                        rusqlite::params![collection, id, field_name, s],
+                    )?;
+                }
+                IndexValue::Int(i) => {
+                    tx.execute(
+                        "INSERT INTO record_indexes (collection, id, field_name, field_value_str, field_value_int, field_value_bool)
+                         VALUES (?1, ?2, ?3, NULL, ?4, NULL)",
+                        rusqlite::params![collection, id, field_name, i],
+                    )?;
+                }
+                IndexValue::Bool(b) => {
+                    tx.execute(
+                        "INSERT INTO record_indexes (collection, id, field_name, field_value_str, field_value_int, field_value_bool)
+                         VALUES (?1, ?2, ?3, NULL, NULL, ?4)",
+                        rusqlite::params![collection, id, field_name, *b as i64],
+                    )?;
                 }
             }
         }
 
-        Ok(false)
+        Ok(())
     }
 
-    /// Sync: Rebuild SQLite from JSONL files
+    fn validate_collection_name(name: &str) -> Result<()> {
+        if name.is_empty() {
+            return Err(eyre!("Collection name cannot be empty"));
+        }
+        if name.len() > 64 {
+            return Err(eyre!("Collection name too long: {} (max 64 chars)", name));
+        }
+        if !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+            return Err(eyre!(
+                "Invalid collection name: {} (must be alphanumeric with _/-)",
+                name
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_field_name(name: &str) -> Result<()> {
+        if name.is_empty() {
+            return Err(eyre!("Field name cannot be empty"));
+        }
+        if name.len() > 64 {
+            return Err(eyre!("Field name too long: {} (max 64 chars)", name));
+        }
+        if !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Err(eyre!("Invalid field name: {} (must be alphanumeric with _)", name));
+        }
+        Ok(())
+    }
+
+    // ========================================================================
+    // Sync operations
+    // ========================================================================
+
+    /// Sync SQLite database from JSONL files
     pub fn sync(&mut self) -> Result<()> {
-        use crate::jsonl::read_jsonl_latest;
-        use crate::models::{Dependency, Execution, Prd, PrdStatus, RepoState, TaskSpec, TaskSpecStatus, Workflow};
+        info!("Syncing database from JSONL files");
 
-        info!("Syncing store from JSONL files");
+        // Clear all tables
+        self.db.execute("DELETE FROM record_indexes", [])?;
+        self.db.execute("DELETE FROM records", [])?;
 
-        // Clear existing data
-        self.db.execute("DELETE FROM dependencies", [])?;
-        self.db.execute("DELETE FROM executions", [])?;
-        self.db.execute("DELETE FROM task_specs", [])?;
-        self.db.execute("DELETE FROM prds", [])?;
-        self.db.execute("DELETE FROM workflows", [])?;
-        self.db.execute("DELETE FROM repo_state", [])?;
+        // Read all JSONL files
+        for entry in fs::read_dir(&self.base_path)? {
+            let entry = entry?;
+            let path = entry.path();
 
-        // Rebuild from JSONL files
-        let prds: std::collections::HashMap<String, Prd> = read_jsonl_latest(&self.base_path.join("prds.jsonl"))?;
-        for prd in prds.values() {
-            let status_str = match prd.status {
-                PrdStatus::Draft => "draft",
-                PrdStatus::Ready => "ready",
-                PrdStatus::Active => "active",
-                PrdStatus::Complete => "complete",
-                PrdStatus::Cancelled => "cancelled",
-            };
-            self.db.execute(
-                "INSERT INTO prds (id, title, description, created_at, updated_at, status, review_passes, content)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                (
-                    &prd.id,
-                    &prd.title,
-                    &prd.description,
-                    prd.created_at,
-                    prd.updated_at,
-                    status_str,
-                    prd.review_passes,
-                    &prd.content,
-                ),
-            )?;
+            if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                continue;
+            }
+
+            let collection = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| eyre!("Invalid JSONL filename: {:?}", path))?;
+
+            debug!("Syncing collection: {}", collection);
+
+            // Read records from JSONL
+            let records = jsonl::read_jsonl_latest(&path)?;
+
+            // Insert into SQLite
+            for (id, record) in records {
+                // Skip tombstones
+                if record.get("deleted").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    continue;
+                }
+
+                let data_json = serde_json::to_string(&record)?;
+                let updated_at = record.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0);
+
+                self.db.execute(
+                    "INSERT OR REPLACE INTO records (collection, id, data_json, updated_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![collection, &id, data_json, updated_at],
+                )?;
+
+                // Note: We don't restore indexes during sync since we don't know
+                // which fields were indexed. This is a limitation of the generic approach.
+                // Indexes will be rebuilt on next write operation.
+            }
         }
 
-        let task_specs: std::collections::HashMap<String, TaskSpec> =
-            read_jsonl_latest(&self.base_path.join("task_specs.jsonl"))?;
-        for ts in task_specs.values() {
-            let status_str = match ts.status {
-                TaskSpecStatus::Pending => "pending",
-                TaskSpecStatus::Running => "running",
-                TaskSpecStatus::Complete => "complete",
-                TaskSpecStatus::Failed => "failed",
-            };
-            self.db.execute(
-                "INSERT INTO task_specs (id, prd_id, phase_name, description, created_at, updated_at,
-                                        status, workflow_name, assigned_to, content)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                (
-                    &ts.id,
-                    &ts.prd_id,
-                    &ts.phase_name,
-                    &ts.description,
-                    ts.created_at,
-                    ts.updated_at,
-                    status_str,
-                    &ts.workflow_name,
-                    &ts.assigned_to,
-                    &ts.content,
-                ),
-            )?;
-        }
-
-        let executions: std::collections::HashMap<String, Execution> =
-            read_jsonl_latest(&self.base_path.join("executions.jsonl"))?;
-        for exec in executions.values() {
-            let status_str = match exec.status {
-                crate::models::ExecStatus::Running => "running",
-                crate::models::ExecStatus::Paused => "paused",
-                crate::models::ExecStatus::Complete => "complete",
-                crate::models::ExecStatus::Failed => "failed",
-                crate::models::ExecStatus::Stopped => "stopped",
-            };
-            self.db.execute(
-                "INSERT INTO executions (id, ts_id, worktree_path, branch_name, status, started_at,
-                                        updated_at, completed_at, current_phase, iteration_count, error_message)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                (
-                    &exec.id,
-                    &exec.ts_id,
-                    &exec.worktree_path,
-                    &exec.branch_name,
-                    status_str,
-                    exec.started_at,
-                    exec.updated_at,
-                    exec.completed_at,
-                    &exec.current_phase,
-                    exec.iteration_count,
-                    &exec.error_message,
-                ),
-            )?;
-        }
-
-        let dependencies: std::collections::HashMap<String, Dependency> =
-            read_jsonl_latest(&self.base_path.join("dependencies.jsonl"))?;
-        for dep in dependencies.values() {
-            let type_str = match dep.dependency_type {
-                crate::models::DependencyType::Notify => "notify",
-                crate::models::DependencyType::Query => "query",
-                crate::models::DependencyType::Share => "share",
-            };
-            self.db.execute(
-                "INSERT INTO dependencies (id, from_exec_id, to_exec_id, dependency_type, created_at, resolved_at, payload)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                (
-                    &dep.id,
-                    &dep.from_exec_id,
-                    &dep.to_exec_id,
-                    type_str,
-                    dep.created_at,
-                    dep.resolved_at,
-                    &dep.payload,
-                ),
-            )?;
-        }
-
-        let workflows: std::collections::HashMap<String, Workflow> =
-            read_jsonl_latest(&self.base_path.join("workflows.jsonl"))?;
-        for workflow in workflows.values() {
-            self.db.execute(
-                "INSERT INTO workflows (id, name, version, created_at, updated_at, content)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                (
-                    &workflow.id,
-                    &workflow.name,
-                    &workflow.version,
-                    workflow.created_at,
-                    workflow.updated_at,
-                    &workflow.content,
-                ),
-            )?;
-        }
-
-        let repo_states: std::collections::HashMap<String, RepoState> =
-            read_jsonl_latest(&self.base_path.join("repo_state.jsonl"))?;
-        for state in repo_states.values() {
-            self.db.execute(
-                "INSERT INTO repo_state (repo_path, last_synced_commit, updated_at)
-                 VALUES (?1, ?2, ?3)",
-                (&state.repo_path, &state.last_synced_commit, state.updated_at),
-            )?;
-        }
-
-        info!(
-            prds = prds.len(),
-            task_specs = task_specs.len(),
-            executions = executions.len(),
-            "Sync complete"
-        );
-
+        info!("Sync complete");
         Ok(())
     }
 
-    /// Flush: Ensure all writes are persisted
-    pub fn flush(&mut self) -> Result<()> {
-        // SQLite auto-commits, JSONL writes are sync
-        // This is a no-op for now, but provides API for future optimization
-        Ok(())
-    }
-
-    // ===== PRD Operations =====
-
-    /// Create a new PRD
-    pub fn create_prd(&mut self, prd: crate::models::Prd) -> Result<String> {
-        use crate::jsonl::append_jsonl;
-        use crate::models::PrdStatus;
-
-        // Write to JSONL first (source of truth)
-        let jsonl_path = self.base_path.join("prds.jsonl");
-        append_jsonl(&jsonl_path, &prd)?;
-
-        // Then write to SQLite (cache)
-        let status_str = match prd.status {
-            PrdStatus::Draft => "draft",
-            PrdStatus::Ready => "ready",
-            PrdStatus::Active => "active",
-            PrdStatus::Complete => "complete",
-            PrdStatus::Cancelled => "cancelled",
-        };
-
-        self.db.execute(
-            "INSERT INTO prds (id, title, description, created_at, updated_at, status, review_passes, content)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            (
-                &prd.id,
-                &prd.title,
-                &prd.description,
-                prd.created_at,
-                prd.updated_at,
-                status_str,
-                prd.review_passes,
-                &prd.content,
-            ),
-        )?;
-
-        Ok(prd.id.clone())
-    }
-
-    /// Get a PRD by ID
-    pub fn get_prd(&self, id: &str) -> Result<Option<crate::models::Prd>> {
-        use crate::models::{Prd, PrdStatus};
-        let mut stmt = self.db.prepare(
-            "SELECT id, title, description, created_at, updated_at, status, review_passes, content
-             FROM prds WHERE id = ?1",
-        )?;
-
-        let prd = stmt.query_row([id], |row| {
-            let status_str: String = row.get(5)?;
-            let status = match status_str.as_str() {
-                "draft" => PrdStatus::Draft,
-                "ready" => PrdStatus::Ready,
-                "active" => PrdStatus::Active,
-                "complete" => PrdStatus::Complete,
-                "cancelled" => PrdStatus::Cancelled,
-                _ => PrdStatus::Draft,
-            };
-
-            Ok(Prd {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                description: row.get(2)?,
-                created_at: row.get(3)?,
-                updated_at: row.get(4)?,
-                status,
-                review_passes: row.get(6)?,
-                content: row.get(7)?,
-            })
-        });
-
-        match prd {
-            Ok(p) => Ok(Some(p)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Update an existing PRD
-    pub fn update_prd(&mut self, id: &str, prd: crate::models::Prd) -> Result<()> {
-        use crate::jsonl::append_jsonl;
-        use crate::models::PrdStatus;
-
-        // Write to JSONL first (source of truth)
-        let jsonl_path = self.base_path.join("prds.jsonl");
-        append_jsonl(&jsonl_path, &prd)?;
-
-        // Then update SQLite (cache)
-        let status_str = match prd.status {
-            PrdStatus::Draft => "draft",
-            PrdStatus::Ready => "ready",
-            PrdStatus::Active => "active",
-            PrdStatus::Complete => "complete",
-            PrdStatus::Cancelled => "cancelled",
-        };
-
-        let rows = self.db.execute(
-            "UPDATE prds SET title = ?1, description = ?2, updated_at = ?3, status = ?4,
-                            review_passes = ?5, content = ?6 WHERE id = ?7",
-            (
-                &prd.title,
-                &prd.description,
-                prd.updated_at,
-                status_str,
-                prd.review_passes,
-                &prd.content,
-                id,
-            ),
-        )?;
-
-        if rows == 0 {
-            return Err(eyre!("PRD not found: {}", id));
-        }
-
-        Ok(())
-    }
-
-    /// List PRDs, optionally filtered by status
-    pub fn list_prds(&self, status: Option<crate::models::PrdStatus>) -> Result<Vec<crate::models::Prd>> {
-        use crate::models::{Prd, PrdStatus};
-
-        let query = if let Some(status_filter) = status {
-            let status_str = match status_filter {
-                PrdStatus::Draft => "draft",
-                PrdStatus::Ready => "ready",
-                PrdStatus::Active => "active",
-                PrdStatus::Complete => "complete",
-                PrdStatus::Cancelled => "cancelled",
-            };
-            format!(
-                "SELECT id, title, description, created_at, updated_at, status, review_passes, content
-                 FROM prds WHERE status = '{}' ORDER BY created_at DESC",
-                status_str
-            )
-        } else {
-            "SELECT id, title, description, created_at, updated_at, status, review_passes, content
-             FROM prds ORDER BY created_at DESC"
-                .to_string()
-        };
-
-        let mut stmt = self.db.prepare(&query)?;
-        let prds = stmt
-            .query_map([], |row| {
-                let status_str: String = row.get(5)?;
-                let status = match status_str.as_str() {
-                    "draft" => PrdStatus::Draft,
-                    "ready" => PrdStatus::Ready,
-                    "active" => PrdStatus::Active,
-                    "complete" => PrdStatus::Complete,
-                    "cancelled" => PrdStatus::Cancelled,
-                    _ => PrdStatus::Draft,
-                };
-
-                Ok(Prd {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    description: row.get(2)?,
-                    created_at: row.get(3)?,
-                    updated_at: row.get(4)?,
-                    status,
-                    review_passes: row.get(6)?,
-                    content: row.get(7)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(prds)
-    }
-
-    // ===== TaskSpec Operations =====
-
-    /// Create a new TaskSpec
-    pub fn create_task_spec(&mut self, ts: crate::models::TaskSpec) -> Result<String> {
-        use crate::jsonl::append_jsonl;
-        use crate::models::TaskSpecStatus;
-
-        // Write to JSONL first
-        let jsonl_path = self.base_path.join("task_specs.jsonl");
-        append_jsonl(&jsonl_path, &ts)?;
-
-        // Then SQLite
-        let status_str = match ts.status {
-            TaskSpecStatus::Pending => "pending",
-            TaskSpecStatus::Running => "running",
-            TaskSpecStatus::Complete => "complete",
-            TaskSpecStatus::Failed => "failed",
-        };
-
-        self.db.execute(
-            "INSERT INTO task_specs (id, prd_id, phase_name, description, created_at, updated_at,
-                                    status, workflow_name, assigned_to, content)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            (
-                &ts.id,
-                &ts.prd_id,
-                &ts.phase_name,
-                &ts.description,
-                ts.created_at,
-                ts.updated_at,
-                status_str,
-                &ts.workflow_name,
-                &ts.assigned_to,
-                &ts.content,
-            ),
-        )?;
-
-        Ok(ts.id.clone())
-    }
-
-    /// Get a TaskSpec by ID
-    pub fn get_task_spec(&self, id: &str) -> Result<Option<crate::models::TaskSpec>> {
-        use crate::models::{TaskSpec, TaskSpecStatus};
-        let mut stmt = self.db.prepare(
-            "SELECT id, prd_id, phase_name, description, created_at, updated_at, status,
-                    workflow_name, assigned_to, content
-             FROM task_specs WHERE id = ?1",
-        )?;
-
-        let ts = stmt.query_row([id], |row| {
-            let status_str: String = row.get(6)?;
-            let status = match status_str.as_str() {
-                "pending" => TaskSpecStatus::Pending,
-                "running" => TaskSpecStatus::Running,
-                "complete" => TaskSpecStatus::Complete,
-                "failed" => TaskSpecStatus::Failed,
-                _ => TaskSpecStatus::Pending,
-            };
-
-            Ok(TaskSpec {
-                id: row.get(0)?,
-                prd_id: row.get(1)?,
-                phase_name: row.get(2)?,
-                description: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
-                status,
-                workflow_name: row.get(7)?,
-                assigned_to: row.get(8)?,
-                content: row.get(9)?,
-            })
-        });
-
-        match ts {
-            Ok(t) => Ok(Some(t)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Update an existing TaskSpec
-    pub fn update_task_spec(&mut self, id: &str, ts: crate::models::TaskSpec) -> Result<()> {
-        use crate::jsonl::append_jsonl;
-        use crate::models::TaskSpecStatus;
-
-        // Write to JSONL first
-        let jsonl_path = self.base_path.join("task_specs.jsonl");
-        append_jsonl(&jsonl_path, &ts)?;
-
-        // Then SQLite
-        let status_str = match ts.status {
-            TaskSpecStatus::Pending => "pending",
-            TaskSpecStatus::Running => "running",
-            TaskSpecStatus::Complete => "complete",
-            TaskSpecStatus::Failed => "failed",
-        };
-
-        let rows = self.db.execute(
-            "UPDATE task_specs SET prd_id = ?1, phase_name = ?2, description = ?3, updated_at = ?4,
-                                  status = ?5, workflow_name = ?6, assigned_to = ?7, content = ?8
-             WHERE id = ?9",
-            (
-                &ts.prd_id,
-                &ts.phase_name,
-                &ts.description,
-                ts.updated_at,
-                status_str,
-                &ts.workflow_name,
-                &ts.assigned_to,
-                &ts.content,
-                id,
-            ),
-        )?;
-
-        if rows == 0 {
-            return Err(eyre!("TaskSpec not found: {}", id));
-        }
-
-        Ok(())
-    }
-
-    /// List all TaskSpecs for a PRD
-    pub fn list_task_specs(&self, prd_id: &str) -> Result<Vec<crate::models::TaskSpec>> {
-        use crate::models::{TaskSpec, TaskSpecStatus};
-
-        let mut stmt = self.db.prepare(
-            "SELECT id, prd_id, phase_name, description, created_at, updated_at, status,
-                    workflow_name, assigned_to, content
-             FROM task_specs WHERE prd_id = ?1 ORDER BY created_at ASC",
-        )?;
-
-        let specs = stmt
-            .query_map([prd_id], |row| {
-                let status_str: String = row.get(6)?;
-                let status = match status_str.as_str() {
-                    "pending" => TaskSpecStatus::Pending,
-                    "running" => TaskSpecStatus::Running,
-                    "complete" => TaskSpecStatus::Complete,
-                    "failed" => TaskSpecStatus::Failed,
-                    _ => TaskSpecStatus::Pending,
-                };
-
-                Ok(TaskSpec {
-                    id: row.get(0)?,
-                    prd_id: row.get(1)?,
-                    phase_name: row.get(2)?,
-                    description: row.get(3)?,
-                    created_at: row.get(4)?,
-                    updated_at: row.get(5)?,
-                    status,
-                    workflow_name: row.get(7)?,
-                    assigned_to: row.get(8)?,
-                    content: row.get(9)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(specs)
-    }
-
-    /// List all pending TaskSpecs
-    pub fn list_pending_task_specs(&self) -> Result<Vec<crate::models::TaskSpec>> {
-        use crate::models::{TaskSpec, TaskSpecStatus};
-
-        let mut stmt = self.db.prepare(
-            "SELECT id, prd_id, phase_name, description, created_at, updated_at, status,
-                    workflow_name, assigned_to, content
-             FROM task_specs WHERE status = 'pending' ORDER BY created_at ASC",
-        )?;
-
-        let specs = stmt
-            .query_map([], |row| {
-                Ok(TaskSpec {
-                    id: row.get(0)?,
-                    prd_id: row.get(1)?,
-                    phase_name: row.get(2)?,
-                    description: row.get(3)?,
-                    created_at: row.get(4)?,
-                    updated_at: row.get(5)?,
-                    status: TaskSpecStatus::Pending,
-                    workflow_name: row.get(7)?,
-                    assigned_to: row.get(8)?,
-                    content: row.get(9)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(specs)
-    }
-
-    // ===== Execution Operations =====
-
-    /// Create a new Execution
-    pub fn create_execution(&mut self, exec: crate::models::Execution) -> Result<String> {
-        use crate::jsonl::append_jsonl;
-        use crate::models::ExecStatus;
-
-        // Write to JSONL first
-        let jsonl_path = self.base_path.join("executions.jsonl");
-        append_jsonl(&jsonl_path, &exec)?;
-
-        // Then SQLite
-        let status_str = match exec.status {
-            ExecStatus::Running => "running",
-            ExecStatus::Paused => "paused",
-            ExecStatus::Complete => "complete",
-            ExecStatus::Failed => "failed",
-            ExecStatus::Stopped => "stopped",
-        };
-
-        self.db.execute(
-            "INSERT INTO executions (id, ts_id, worktree_path, branch_name, status, started_at,
-                                    updated_at, completed_at, current_phase, iteration_count, error_message)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            (
-                &exec.id,
-                &exec.ts_id,
-                &exec.worktree_path,
-                &exec.branch_name,
-                status_str,
-                exec.started_at,
-                exec.updated_at,
-                exec.completed_at,
-                &exec.current_phase,
-                exec.iteration_count,
-                &exec.error_message,
-            ),
-        )?;
-
-        Ok(exec.id.clone())
-    }
-
-    /// Get an Execution by ID
-    pub fn get_execution(&self, id: &str) -> Result<Option<crate::models::Execution>> {
-        use crate::models::{ExecStatus, Execution};
-        let mut stmt = self.db.prepare(
-            "SELECT id, ts_id, worktree_path, branch_name, status, started_at, updated_at,
-                    completed_at, current_phase, iteration_count, error_message
-             FROM executions WHERE id = ?1",
-        )?;
-
-        let exec = stmt.query_row([id], |row| {
-            let status_str: String = row.get(4)?;
-            let status = match status_str.as_str() {
-                "running" => ExecStatus::Running,
-                "paused" => ExecStatus::Paused,
-                "complete" => ExecStatus::Complete,
-                "failed" => ExecStatus::Failed,
-                "stopped" => ExecStatus::Stopped,
-                _ => ExecStatus::Running,
-            };
-
-            Ok(Execution {
-                id: row.get(0)?,
-                ts_id: row.get(1)?,
-                worktree_path: row.get(2)?,
-                branch_name: row.get(3)?,
-                status,
-                started_at: row.get(5)?,
-                updated_at: row.get(6)?,
-                completed_at: row.get(7)?,
-                current_phase: row.get(8)?,
-                iteration_count: row.get(9)?,
-                error_message: row.get(10)?,
-            })
-        });
-
-        match exec {
-            Ok(e) => Ok(Some(e)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Update an existing Execution
-    pub fn update_execution(&mut self, id: &str, exec: crate::models::Execution) -> Result<()> {
-        use crate::jsonl::append_jsonl;
-        use crate::models::ExecStatus;
-
-        // Write to JSONL first
-        let jsonl_path = self.base_path.join("executions.jsonl");
-        append_jsonl(&jsonl_path, &exec)?;
-
-        // Then SQLite
-        let status_str = match exec.status {
-            ExecStatus::Running => "running",
-            ExecStatus::Paused => "paused",
-            ExecStatus::Complete => "complete",
-            ExecStatus::Failed => "failed",
-            ExecStatus::Stopped => "stopped",
-        };
-
-        let rows = self.db.execute(
-            "UPDATE executions SET ts_id = ?1, worktree_path = ?2, branch_name = ?3, status = ?4,
-                                  updated_at = ?5, completed_at = ?6, current_phase = ?7,
-                                  iteration_count = ?8, error_message = ?9
-             WHERE id = ?10",
-            (
-                &exec.ts_id,
-                &exec.worktree_path,
-                &exec.branch_name,
-                status_str,
-                exec.updated_at,
-                exec.completed_at,
-                &exec.current_phase,
-                exec.iteration_count,
-                &exec.error_message,
-                id,
-            ),
-        )?;
-
-        if rows == 0 {
-            return Err(eyre!("Execution not found: {}", id));
-        }
-
-        Ok(())
-    }
-
-    /// List executions, optionally filtered by status
-    pub fn list_executions(&self, status: Option<crate::models::ExecStatus>) -> Result<Vec<crate::models::Execution>> {
-        use crate::models::{ExecStatus, Execution};
-
-        let query = if let Some(status_filter) = status {
-            let status_str = match status_filter {
-                ExecStatus::Running => "running",
-                ExecStatus::Paused => "paused",
-                ExecStatus::Complete => "complete",
-                ExecStatus::Failed => "failed",
-                ExecStatus::Stopped => "stopped",
-            };
-            format!(
-                "SELECT id, ts_id, worktree_path, branch_name, status, started_at, updated_at,
-                        completed_at, current_phase, iteration_count, error_message
-                 FROM executions WHERE status = '{}' ORDER BY started_at DESC",
-                status_str
-            )
-        } else {
-            "SELECT id, ts_id, worktree_path, branch_name, status, started_at, updated_at,
-                    completed_at, current_phase, iteration_count, error_message
-             FROM executions ORDER BY started_at DESC"
-                .to_string()
-        };
-
-        let mut stmt = self.db.prepare(&query)?;
-        let execs = stmt
-            .query_map([], |row| {
-                let status_str: String = row.get(4)?;
-                let status = match status_str.as_str() {
-                    "running" => ExecStatus::Running,
-                    "paused" => ExecStatus::Paused,
-                    "complete" => ExecStatus::Complete,
-                    "failed" => ExecStatus::Failed,
-                    "stopped" => ExecStatus::Stopped,
-                    _ => ExecStatus::Running,
-                };
-
-                Ok(Execution {
-                    id: row.get(0)?,
-                    ts_id: row.get(1)?,
-                    worktree_path: row.get(2)?,
-                    branch_name: row.get(3)?,
-                    status,
-                    started_at: row.get(5)?,
-                    updated_at: row.get(6)?,
-                    completed_at: row.get(7)?,
-                    current_phase: row.get(8)?,
-                    iteration_count: row.get(9)?,
-                    error_message: row.get(10)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(execs)
-    }
-
-    /// List all active (running or paused) executions
-    pub fn list_active_executions(&self) -> Result<Vec<crate::models::Execution>> {
-        use crate::models::{ExecStatus, Execution};
-
-        let mut stmt = self.db.prepare(
-            "SELECT id, ts_id, worktree_path, branch_name, status, started_at, updated_at,
-                    completed_at, current_phase, iteration_count, error_message
-             FROM executions WHERE status IN ('running', 'paused') ORDER BY started_at DESC",
-        )?;
-
-        let execs = stmt
-            .query_map([], |row| {
-                let status_str: String = row.get(4)?;
-                let status = match status_str.as_str() {
-                    "running" => ExecStatus::Running,
-                    "paused" => ExecStatus::Paused,
-                    _ => ExecStatus::Running,
-                };
-
-                Ok(Execution {
-                    id: row.get(0)?,
-                    ts_id: row.get(1)?,
-                    worktree_path: row.get(2)?,
-                    branch_name: row.get(3)?,
-                    status,
-                    started_at: row.get(5)?,
-                    updated_at: row.get(6)?,
-                    completed_at: row.get(7)?,
-                    current_phase: row.get(8)?,
-                    iteration_count: row.get(9)?,
-                    error_message: row.get(10)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(execs)
-    }
-
-    // ===== Git Integration =====
+    // ========================================================================
+    // Git Integration
+    // ========================================================================
 
     /// Install git hooks for automatic sync
     pub fn install_git_hooks(&self) -> Result<()> {
@@ -1019,7 +537,6 @@ impl Store {
         Ok(())
     }
 
-    /// Find the .git directory (handles worktrees)
     fn find_git_dir(&self) -> Result<PathBuf> {
         let mut current = self.base_path.clone();
 
@@ -1029,15 +546,14 @@ impl Store {
             if git_path.exists() {
                 if git_path.is_dir() {
                     return Ok(git_path);
-                } else if git_path.is_file() {
-                    // Worktree - read gitdir from file
+                } else {
+                    // Worktree - read .git file
                     let content = fs::read_to_string(&git_path)?;
-                    for line in content.lines() {
-                        if line.starts_with("gitdir: ") {
-                            let gitdir = line.strip_prefix("gitdir: ").unwrap();
-                            return Ok(PathBuf::from(gitdir));
-                        }
-                    }
+                    let gitdir = content
+                        .strip_prefix("gitdir: ")
+                        .ok_or_else(|| eyre!("Invalid .git file format"))?
+                        .trim();
+                    return Ok(PathBuf::from(gitdir));
                 }
             }
 
@@ -1049,47 +565,34 @@ impl Store {
         Err(eyre!("Not in a git repository"))
     }
 
-    /// Install a single hook
     fn install_hook(&self, hooks_dir: &Path, hook_name: &str, command: &str) -> Result<()> {
         let hook_path = hooks_dir.join(hook_name);
-        let hook_marker = "# taskstore-hook";
+        let hook_content = format!("#!/bin/sh\n# Auto-generated by taskstore\n{}\n", command);
 
-        // Check if hook exists and already has our content
         if hook_path.exists() {
             let existing = fs::read_to_string(&hook_path)?;
-            if existing.contains(hook_marker) {
-                info!(hook = hook_name, "Hook already installed");
+            if existing.contains(command) {
+                debug!("Hook {} already contains command", hook_name);
                 return Ok(());
             }
-
             // Append to existing hook
-            let mut file = fs::OpenOptions::new().append(true).open(&hook_path)?;
-            use std::io::Write;
-            writeln!(file, "\n{}", hook_marker)?;
-            writeln!(file, "{} || echo 'taskstore sync failed (non-fatal)'", command)?;
+            fs::write(&hook_path, format!("{}\n{}", existing, command))?;
         } else {
-            // Create new hook
-            let content = format!(
-                "#!/bin/bash\n{}\n{} || echo 'taskstore sync failed (non-fatal)'\n",
-                hook_marker, command
-            );
-            fs::write(&hook_path, content)?;
-
-            // Make executable
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = fs::metadata(&hook_path)?.permissions();
-                perms.set_mode(0o755);
-                fs::set_permissions(&hook_path, perms)?;
-            }
+            fs::write(&hook_path, hook_content)?;
         }
 
-        info!(hook = hook_name, "Hook installed");
+        // Make executable (Unix only)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&hook_path)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&hook_path, perms)?;
+        }
+
         Ok(())
     }
 
-    /// Install .gitattributes for merge driver
     fn install_gitattributes(&self) -> Result<()> {
         // Find repo root
         let mut repo_root = self.base_path.clone();
@@ -1121,7 +624,6 @@ impl Store {
         Ok(())
     }
 
-    /// Configure git merge driver
     fn configure_merge_driver(&self) -> Result<()> {
         use std::process::Command;
 
@@ -1135,7 +637,7 @@ impl Store {
             .output()?;
 
         if !output.status.success() {
-            warn!("Failed to set merge driver name (non-fatal)");
+            return Err(eyre!("Failed to configure merge driver name"));
         }
 
         let output = Command::new("git")
@@ -1143,30 +645,73 @@ impl Store {
                 "config",
                 "--local",
                 "merge.taskstore-merge.driver",
-                "taskstore-merge %O %A %B",
+                "taskstore-merge %O %A %B %P",
             ])
             .output()?;
 
         if !output.status.success() {
-            warn!("Failed to set merge driver command (non-fatal)");
+            return Err(eyre!("Failed to configure merge driver command"));
         }
 
         Ok(())
     }
 }
 
+// Helper function for timestamps
+pub fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("System time before Unix epoch")
+        .as_millis() as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
     use tempfile::TempDir;
+
+    // Test record type
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    struct TestRecord {
+        id: String,
+        name: String,
+        status: String,
+        count: i64,
+        active: bool,
+        updated_at: i64,
+    }
+
+    impl Record for TestRecord {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn updated_at(&self) -> i64 {
+            self.updated_at
+        }
+
+        fn collection_name() -> &'static str {
+            "test_records"
+        }
+
+        fn indexed_fields(&self) -> HashMap<String, IndexValue> {
+            let mut fields = HashMap::new();
+            fields.insert("status".to_string(), IndexValue::String(self.status.clone()));
+            fields.insert("count".to_string(), IndexValue::Int(self.count));
+            fields.insert("active".to_string(), IndexValue::Bool(self.active));
+            fields
+        }
+    }
 
     #[test]
     fn test_store_open_creates_directory() {
         let temp = TempDir::new().unwrap();
-        let store_path = temp.path().join(".taskstore");
 
-        let _store = Store::open(&store_path).unwrap();
+        let _store = Store::open(temp.path()).unwrap();
+        let store_path = temp.path().join(".taskstore");
         assert!(store_path.exists());
         assert!(store_path.join("taskstore.db").exists());
         assert!(store_path.join(".gitignore").exists());
@@ -1174,387 +719,190 @@ mod tests {
     }
 
     #[test]
-    fn test_gitignore_contents() {
+    fn test_generic_create() {
         let temp = TempDir::new().unwrap();
-        let store_path = temp.path().join(".taskstore");
+        let mut store = Store::open(temp.path()).unwrap();
 
-        Store::open(&store_path).unwrap();
-
-        let gitignore = fs::read_to_string(store_path.join(".gitignore")).unwrap();
-        assert!(gitignore.contains("taskstore.db"));
-        assert!(gitignore.contains("taskstore.log"));
-    }
-
-    #[test]
-    fn test_version_file_created() {
-        let temp = TempDir::new().unwrap();
-        let store_path = temp.path().join(".taskstore");
-
-        Store::open(&store_path).unwrap();
-
-        let version = fs::read_to_string(store_path.join(".version")).unwrap();
-        assert_eq!(version.trim(), CURRENT_VERSION.to_string());
-    }
-
-    #[test]
-    fn test_store_reopen() {
-        let temp = TempDir::new().unwrap();
-        let store_path = temp.path().join(".taskstore");
-
-        // Open first time
-        {
-            let _store = Store::open(&store_path).unwrap();
-        }
-
-        // Reopen should work
-        let store = Store::open(&store_path).unwrap();
-        assert_eq!(store.base_path(), store_path);
-    }
-
-    #[test]
-    fn test_is_stale_fresh_db() {
-        let temp = TempDir::new().unwrap();
-        let store_path = temp.path().join(".taskstore");
-
-        let _store = Store::open(&store_path).unwrap();
-        // Fresh database with no JSONL files should not be stale
-        assert!(!_store.is_stale().unwrap());
-    }
-
-    #[test]
-    fn test_prd_crud() {
-        use crate::models::{Prd, PrdStatus, now_ms};
-        let temp = TempDir::new().unwrap();
-        let store_path = temp.path().join(".taskstore");
-        let mut store = Store::open(&store_path).unwrap();
-
-        // Create
-        let prd = Prd {
-            id: "test-prd-1".to_string(),
-            title: "Test PRD".to_string(),
-            description: "Test description".to_string(),
-            created_at: now_ms(),
+        let record = TestRecord {
+            id: "rec1".to_string(),
+            name: "Test Record 1".to_string(),
+            status: "active".to_string(),
+            count: 42,
+            active: true,
             updated_at: now_ms(),
-            status: PrdStatus::Draft,
-            review_passes: 5,
-            content: "# Test Content".to_string(),
         };
 
-        let id = store.create_prd(prd.clone()).unwrap();
-        assert_eq!(id, "test-prd-1");
-
-        // Read
-        let retrieved = store.get_prd(&id).unwrap();
-        assert!(retrieved.is_some());
-        let retrieved = retrieved.unwrap();
-        assert_eq!(retrieved.title, "Test PRD");
-        assert_eq!(retrieved.status, PrdStatus::Draft);
-
-        // Update
-        let mut updated_prd = retrieved.clone();
-        updated_prd.status = PrdStatus::Active;
-        updated_prd.updated_at = now_ms();
-        store.update_prd(&id, updated_prd).unwrap();
-
-        let retrieved = store.get_prd(&id).unwrap().unwrap();
-        assert_eq!(retrieved.status, PrdStatus::Active);
-
-        // List
-        let prds = store.list_prds(None).unwrap();
-        assert_eq!(prds.len(), 1);
-
-        let draft_prds = store.list_prds(Some(PrdStatus::Draft)).unwrap();
-        assert_eq!(draft_prds.len(), 0);
-
-        let active_prds = store.list_prds(Some(PrdStatus::Active)).unwrap();
-        assert_eq!(active_prds.len(), 1);
-    }
-
-    #[test]
-    fn test_task_spec_crud() {
-        use crate::models::{Prd, PrdStatus, TaskSpec, TaskSpecStatus, now_ms};
-        let temp = TempDir::new().unwrap();
-        let store_path = temp.path().join(".taskstore");
-        let mut store = Store::open(&store_path).unwrap();
-
-        // Create PRD first
-        let prd = Prd {
-            id: "prd-1".to_string(),
-            title: "Test PRD".to_string(),
-            description: "Test".to_string(),
-            created_at: now_ms(),
-            updated_at: now_ms(),
-            status: PrdStatus::Active,
-            review_passes: 5,
-            content: "content".to_string(),
-        };
-        store.create_prd(prd).unwrap();
-
-        // Create TaskSpec
-        let ts = TaskSpec {
-            id: "ts-1".to_string(),
-            prd_id: "prd-1".to_string(),
-            phase_name: "Phase 1".to_string(),
-            description: "Test task".to_string(),
-            created_at: now_ms(),
-            updated_at: now_ms(),
-            status: TaskSpecStatus::Pending,
-            workflow_name: Some("rust-development".to_string()),
-            assigned_to: None,
-            content: "# Task Content".to_string(),
-        };
-
-        let id = store.create_task_spec(ts.clone()).unwrap();
-        assert_eq!(id, "ts-1");
-
-        // Read
-        let retrieved = store.get_task_spec(&id).unwrap().unwrap();
-        assert_eq!(retrieved.phase_name, "Phase 1");
-        assert_eq!(retrieved.status, TaskSpecStatus::Pending);
-
-        // Update
-        let mut updated_ts = retrieved.clone();
-        updated_ts.status = TaskSpecStatus::Running;
-        updated_ts.assigned_to = Some("exec-1".to_string());
-        store.update_task_spec(&id, updated_ts).unwrap();
-
-        let retrieved = store.get_task_spec(&id).unwrap().unwrap();
-        assert_eq!(retrieved.status, TaskSpecStatus::Running);
-        assert_eq!(retrieved.assigned_to, Some("exec-1".to_string()));
-
-        // List by PRD
-        let specs = store.list_task_specs("prd-1").unwrap();
-        assert_eq!(specs.len(), 1);
-
-        // List pending
-        let pending = store.list_pending_task_specs().unwrap();
-        assert_eq!(pending.len(), 0); // We updated it to running
-    }
-
-    #[test]
-    fn test_execution_crud() {
-        use crate::models::{ExecStatus, Execution, Prd, PrdStatus, TaskSpec, TaskSpecStatus, now_ms};
-        let temp = TempDir::new().unwrap();
-        let store_path = temp.path().join(".taskstore");
-        let mut store = Store::open(&store_path).unwrap();
-
-        // Create PRD and TaskSpec first
-        let prd = Prd {
-            id: "prd-1".to_string(),
-            title: "Test PRD".to_string(),
-            description: "Test".to_string(),
-            created_at: now_ms(),
-            updated_at: now_ms(),
-            status: PrdStatus::Active,
-            review_passes: 5,
-            content: "content".to_string(),
-        };
-        store.create_prd(prd).unwrap();
-
-        let ts = TaskSpec {
-            id: "ts-1".to_string(),
-            prd_id: "prd-1".to_string(),
-            phase_name: "Phase 1".to_string(),
-            description: "Test task".to_string(),
-            created_at: now_ms(),
-            updated_at: now_ms(),
-            status: TaskSpecStatus::Pending,
-            workflow_name: None,
-            assigned_to: None,
-            content: "content".to_string(),
-        };
-        store.create_task_spec(ts).unwrap();
-
-        // Create Execution
-        let exec = Execution {
-            id: "exec-1".to_string(),
-            ts_id: "ts-1".to_string(),
-            worktree_path: "/tmp/worktree".to_string(),
-            branch_name: "feature/test".to_string(),
-            status: ExecStatus::Running,
-            started_at: now_ms(),
-            updated_at: now_ms(),
-            completed_at: None,
-            current_phase: Some("Phase 1".to_string()),
-            iteration_count: 0,
-            error_message: None,
-        };
-
-        let id = store.create_execution(exec.clone()).unwrap();
-        assert_eq!(id, "exec-1");
-
-        // Read
-        let retrieved = store.get_execution(&id).unwrap().unwrap();
-        assert_eq!(retrieved.status, ExecStatus::Running);
-        assert_eq!(retrieved.iteration_count, 0);
-
-        // Update
-        let mut updated_exec = retrieved.clone();
-        updated_exec.iteration_count = 5;
-        updated_exec.status = ExecStatus::Complete;
-        updated_exec.completed_at = Some(now_ms());
-        store.update_execution(&id, updated_exec).unwrap();
-
-        let retrieved = store.get_execution(&id).unwrap().unwrap();
-        assert_eq!(retrieved.status, ExecStatus::Complete);
-        assert_eq!(retrieved.iteration_count, 5);
-        assert!(retrieved.completed_at.is_some());
-
-        // List all
-        let execs = store.list_executions(None).unwrap();
-        assert_eq!(execs.len(), 1);
-
-        // List by status
-        let running = store.list_executions(Some(ExecStatus::Running)).unwrap();
-        assert_eq!(running.len(), 0);
-
-        let complete = store.list_executions(Some(ExecStatus::Complete)).unwrap();
-        assert_eq!(complete.len(), 1);
-
-        // List active (should be empty since we completed it)
-        let active = store.list_active_executions().unwrap();
-        assert_eq!(active.len(), 0);
-    }
-
-    #[test]
-    fn test_update_nonexistent_returns_error() {
-        use crate::models::{Prd, PrdStatus, now_ms};
-        let temp = TempDir::new().unwrap();
-        let store_path = temp.path().join(".taskstore");
-        let mut store = Store::open(&store_path).unwrap();
-
-        let prd = Prd {
-            id: "nonexistent".to_string(),
-            title: "Test".to_string(),
-            description: "Test".to_string(),
-            created_at: now_ms(),
-            updated_at: now_ms(),
-            status: PrdStatus::Draft,
-            review_passes: 0,
-            content: "content".to_string(),
-        };
-
-        let result = store.update_prd("nonexistent", prd);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("PRD not found"));
-    }
-
-    #[test]
-    fn test_jsonl_write_through() {
-        use crate::models::{Prd, PrdStatus, now_ms};
-        let temp = TempDir::new().unwrap();
-        let store_path = temp.path().join(".taskstore");
-        let mut store = Store::open(&store_path).unwrap();
-
-        // Create PRD
-        let prd = Prd {
-            id: "test-1".to_string(),
-            title: "Test PRD".to_string(),
-            description: "Test".to_string(),
-            created_at: now_ms(),
-            updated_at: now_ms(),
-            status: PrdStatus::Draft,
-            review_passes: 0,
-            content: "content".to_string(),
-        };
-        store.create_prd(prd).unwrap();
+        let id = store.create(record.clone()).unwrap();
+        assert_eq!(id, "rec1");
 
         // Verify JSONL file was created
-        let jsonl_path = store_path.join("prds.jsonl");
+        let jsonl_path = temp.path().join(".taskstore/test_records.jsonl");
         assert!(jsonl_path.exists());
 
-        // Verify content was written
-        let content = fs::read_to_string(&jsonl_path).unwrap();
-        assert!(content.contains("test-1"));
-        assert!(content.contains("Test PRD"));
+        // Verify record in SQLite
+        let retrieved: Option<TestRecord> = store.get("rec1").unwrap();
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.name, "Test Record 1");
+        assert_eq!(retrieved.status, "active");
+        assert_eq!(retrieved.count, 42);
+        assert_eq!(retrieved.active, true);
     }
 
     #[test]
-    fn test_sync_rebuilds_from_jsonl() {
-        use crate::models::{Prd, PrdStatus};
+    fn test_generic_get_nonexistent() {
         let temp = TempDir::new().unwrap();
-        let store_path = temp.path().join(".taskstore");
+        let store = Store::open(temp.path()).unwrap();
 
-        // Create and populate store
-        {
-            let mut store = Store::open(&store_path).unwrap();
-
-            let prd1 = Prd {
-                id: "test-1".to_string(),
-                title: "PRD 1".to_string(),
-                description: "Test".to_string(),
-                created_at: 1000,
-                updated_at: 1000,
-                status: PrdStatus::Draft,
-                review_passes: 0,
-                content: "content1".to_string(),
-            };
-            store.create_prd(prd1).unwrap();
-
-            // Update the PRD (creates new JSONL entry)
-            let prd2 = Prd {
-                id: "test-1".to_string(),
-                title: "PRD 1 Updated".to_string(),
-                description: "Test".to_string(),
-                created_at: 1000,
-                updated_at: 2000, // Newer timestamp
-                status: PrdStatus::Active,
-                review_passes: 5,
-                content: "content2".to_string(),
-            };
-            store.update_prd("test-1", prd2).unwrap();
-        }
-
-        // Delete SQLite database to simulate stale state
-        fs::remove_file(store_path.join("taskstore.db")).unwrap();
-
-        // Reopen store, should trigger sync
-        {
-            let store = Store::open(&store_path).unwrap();
-
-            // Verify latest version was restored
-            let prd = store.get_prd("test-1").unwrap().unwrap();
-            assert_eq!(prd.title, "PRD 1 Updated");
-            assert_eq!(prd.updated_at, 2000);
-            assert_eq!(prd.status, PrdStatus::Active);
-            assert_eq!(prd.review_passes, 5);
-        }
+        let result: Option<TestRecord> = store.get("nonexistent").unwrap();
+        assert!(result.is_none());
     }
 
     #[test]
-    fn test_sync_handles_multiple_records() {
-        use crate::models::{Prd, PrdStatus, now_ms};
+    fn test_generic_update() {
         let temp = TempDir::new().unwrap();
-        let store_path = temp.path().join(".taskstore");
+        let mut store = Store::open(temp.path()).unwrap();
+
+        // Create initial record
+        let mut record = TestRecord {
+            id: "rec1".to_string(),
+            name: "Original".to_string(),
+            status: "draft".to_string(),
+            count: 1,
+            active: false,
+            updated_at: 1000,
+        };
+        store.create(record.clone()).unwrap();
+
+        // Update record
+        record.name = "Updated".to_string();
+        record.status = "active".to_string();
+        record.count = 2;
+        record.active = true;
+        record.updated_at = 2000;
+        store.update(record.clone()).unwrap();
+
+        // Verify update
+        let retrieved: Option<TestRecord> = store.get("rec1").unwrap();
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.name, "Updated");
+        assert_eq!(retrieved.status, "active");
+        assert_eq!(retrieved.count, 2);
+        assert_eq!(retrieved.active, true);
+        assert_eq!(retrieved.updated_at, 2000);
+    }
+
+    #[test]
+    fn test_generic_delete() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+
+        // Create record
+        let record = TestRecord {
+            id: "rec1".to_string(),
+            name: "To Delete".to_string(),
+            status: "active".to_string(),
+            count: 1,
+            active: true,
+            updated_at: now_ms(),
+        };
+        store.create(record).unwrap();
+
+        // Delete record
+        store.delete::<TestRecord>("rec1").unwrap();
+
+        // Verify deleted from SQLite
+        let retrieved: Option<TestRecord> = store.get("rec1").unwrap();
+        assert!(retrieved.is_none());
+
+        // Verify tombstone in JSONL
+        let jsonl_path = temp.path().join(".taskstore/test_records.jsonl");
+        let content = fs::read_to_string(jsonl_path).unwrap();
+        assert!(content.contains("\"deleted\":true"));
+    }
+
+    #[test]
+    fn test_generic_list_no_filters() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
 
         // Create multiple records
-        {
-            let mut store = Store::open(&store_path).unwrap();
-
-            for i in 1..=5 {
-                let prd = Prd {
-                    id: format!("test-{}", i),
-                    title: format!("PRD {}", i),
-                    description: "Test".to_string(),
-                    created_at: now_ms(),
-                    updated_at: now_ms(),
-                    status: PrdStatus::Draft,
-                    review_passes: 0,
-                    content: "content".to_string(),
-                };
-                store.create_prd(prd).unwrap();
-            }
+        for i in 1..=3 {
+            let record = TestRecord {
+                id: format!("rec{}", i),
+                name: format!("Record {}", i),
+                status: "active".to_string(),
+                count: i,
+                active: true,
+                updated_at: now_ms(),
+            };
+            store.create(record).unwrap();
         }
 
-        // Delete SQLite and reopen
-        fs::remove_file(store_path.join("taskstore.db")).unwrap();
+        // List all records
+        let records: Vec<TestRecord> = store.list(&[]).unwrap();
+        assert_eq!(records.len(), 3);
+    }
 
-        {
-            let store = Store::open(&store_path).unwrap();
+    #[test]
+    fn test_generic_list_with_filter() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
 
-            // Verify all records restored
-            let prds = store.list_prds(None).unwrap();
-            assert_eq!(prds.len(), 5);
-        }
+        // Create records with different statuses
+        let record1 = TestRecord {
+            id: "rec1".to_string(),
+            name: "Record 1".to_string(),
+            status: "active".to_string(),
+            count: 1,
+            active: true,
+            updated_at: now_ms(),
+        };
+        let record2 = TestRecord {
+            id: "rec2".to_string(),
+            name: "Record 2".to_string(),
+            status: "draft".to_string(),
+            count: 2,
+            active: true,
+            updated_at: now_ms(),
+        };
+
+        store.create(record1).unwrap();
+        store.create(record2).unwrap();
+
+        // Filter by status = "active"
+        let filters = vec![Filter {
+            field: "status".to_string(),
+            op: crate::filter::FilterOp::Eq,
+            value: IndexValue::String("active".to_string()),
+        }];
+
+        let records: Vec<TestRecord> = store.list(&filters).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, "active");
+    }
+
+    #[test]
+    fn test_validation_collection_name() {
+        // Valid
+        assert!(Store::validate_collection_name("valid_name").is_ok());
+        assert!(Store::validate_collection_name("valid-name").is_ok());
+
+        // Invalid
+        assert!(Store::validate_collection_name("invalid/name").is_err());
+        assert!(Store::validate_collection_name("").is_err());
+        assert!(Store::validate_collection_name(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn test_validation_field_name() {
+        // Valid
+        assert!(Store::validate_field_name("valid_field").is_ok());
+
+        // Invalid
+        assert!(Store::validate_field_name("invalid-field").is_err());
+        assert!(Store::validate_field_name("").is_err());
+        assert!(Store::validate_field_name(&"a".repeat(65)).is_err());
     }
 }
