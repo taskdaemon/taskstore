@@ -1,49 +1,50 @@
-# Design Document: TaskStore - Persistent State Management
+# Design Document: TaskStore - Generic Persistent Storage Library
 
 **Author:** Claude Sonnet 4.5
-**Date:** 2026-01-13
+**Date:** 2026-01-14
 **Status:** Complete
 **Review Passes:** 5/5
 
 ## Summary
 
-TaskStore is a Rust library providing durable, git-integrated persistent storage for TaskDaemon's PRDs, task specs, execution state, and coordination data. It implements the SQLite+JSONL+Git pattern: SQLite for fast queries, JSONL files for git-based truth and merge conflict resolution, and a custom git merge driver for automated conflict handling.
+TaskStore is a Rust library providing durable, git-integrated persistent storage for any data type implementing the `Record` trait. It implements the SQLite+JSONL+Git pattern: SQLite for fast queries, JSONL files for git-based truth and merge conflict resolution, and a custom git merge driver for automated conflict handling.
 
 ## Problem Statement
 
 ### Background
 
-TaskDaemon orchestrates multiple concurrent agentic loops, each executing phases of work defined by task specifications derived from product requirements documents. This creates several persistence challenges:
+Modern development workflows increasingly rely on git for version control, but many applications need persistent storage that:
 
-1. **State Durability:** Loop executions can crash, be interrupted, or need to pause/resume. All state must survive these events.
-2. **Concurrent Access:** Multiple loops query and update state simultaneously without blocking each other.
-3. **Merge Conflicts:** When loops work in separate git worktrees and merge back to main, state files can conflict.
-4. **Auditability:** Teams need to review what work was done, track progress, and debug failures.
-5. **Version Control:** State should be versioned alongside code, allowing rollback and branch comparison.
+1. **Survives crashes:** Application state must persist across restarts and failures
+2. **Merges cleanly:** When developers work in separate git branches/worktrees, state should merge without conflicts
+3. **Queries efficiently:** Applications need fast indexed lookups, not O(n) scans
+4. **Audits transparently:** Teams need human-readable state files for review and debugging
+5. **Versions naturally:** State should evolve alongside code in git history
 
 Existing solutions fall short:
-- **In-memory only:** Lost on crash
-- **SQLite alone:** Not git-friendly, binary format causes merge conflicts
-- **JSONL alone:** Slow queries, no indexing
-- **Beads:** Overcomplicated, invasive behavior, poor user experience
-- **Engram:** Lost git integration (merge driver, hooks) by accident during decoupling
+- **In-memory only:** Lost on crash, no persistence
+- **SQLite alone:** Binary format causes merge conflicts, not git-friendly
+- **JSONL alone:** Slow queries, no indexing, O(n) scans
+- **Beads:** Overcomplicated, invasive auto-push behavior, poor UX
+- **Engram:** Lost git integration (merge driver, hooks) during refactoring
 
 ### Problem
 
-**How do we build a persistent state store that is:**
-- **Fast:** Sub-millisecond queries for lookups
-- **Durable:** Survives crashes, supports pause/resume
-- **Git-native:** Merges cleanly, works with worktrees
-- **Concurrent:** Multiple readers/writers without blocking
-- **Auditable:** Human-readable state files
+**How do we build a generic persistent storage library that is:**
+- **Fast:** Sub-millisecond queries for indexed lookups
+- **Durable:** Survives crashes, supports graceful shutdown/restart
+- **Git-native:** Merges cleanly, works with worktrees and branches
+- **Concurrent:** Multiple readers without blocking
+- **Auditable:** Human-readable state files for review
 - **Simple:** Thin library, minimal API surface
+- **Generic:** Works with any data type implementing a trait
 
 ### Goals
 
 - Implement SQLite+JSONL+Git pattern with custom merge driver
-- Provide CRUD operations for PRDs, task specs, executions, dependencies
+- Provide generic CRUD operations for any `Record` type
 - Support atomic transactions for multi-record updates
-- Enable fast queries: "Show all running executions", "Get TS dependencies", etc.
+- Enable fast queries via SQLite indexes
 - Store state as line-delimited JSON (one record per line) for merge-friendliness
 - Include git hooks for automatic sync on commit/merge/rebase
 - Support graceful degradation: If SQLite is stale, rebuild from JSONL
@@ -52,10 +53,10 @@ Existing solutions fall short:
 ### Non-Goals
 
 - **Not a distributed database:** Single machine, single process writes
-- **Not a replacement for git:** Git remains source of truth
-- **Not a query engine:** No complex SQL beyond simple lookups
-- **Not a workflow engine:** TaskDaemon handles orchestration
-- **Not user-facing:** Internal library consumed by TaskDaemon
+- **Not a replacement for git:** Git remains source of truth for versioning
+- **Not a query engine:** No complex SQL beyond simple indexed lookups
+- **Not a workflow engine:** Applications handle their own orchestration
+- **Not user-facing:** Infrastructure library consumed by applications
 - **Not a background service:** Embedded library, not daemon process
 
 ## Proposed Solution
@@ -77,8 +78,8 @@ Git hooks (pre-commit, post-merge, post-rebase) trigger sync operations to keep 
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                      TaskDaemon                          │
-│                    (orchestrator)                        │
+│                   Your Application                       │
+│         (plans, users, tasks, events, etc.)              │
 └────────────────┬────────────────────────────────────────┘
                  │
                  │ uses
@@ -88,10 +89,10 @@ Git hooks (pre-commit, post-merge, post-rebase) trigger sync operations to keep 
 │  ┌─────────────────────────────────────────────────┐   │
 │  │              Public API                          │   │
 │  │  - Store::open(path)                            │   │
-│  │  - store.create_prd(prd)                        │   │
-│  │  - store.get_prd(id)                            │   │
-│  │  - store.update_execution(id, status)           │   │
-│  │  - store.list_active_executions()               │   │
+│  │  - store.create<T>(record)                      │   │
+│  │  - store.get<T>(id)                             │   │
+│  │  - store.update<T>(id, record)                  │   │
+│  │  - store.list<T>(filter)                        │   │
 │  │  - store.sync()                                  │   │
 │  └─────────────┬───────────────────────────────────┘   │
 │                │                                         │
@@ -127,121 +128,212 @@ Git hooks (pre-commit, post-merge, post-rebase) trigger sync operations to keep 
 
 ### Data Model
 
+#### The Record Trait
+
+All types stored in TaskStore must implement the `Record` trait:
+
+```rust
+pub trait Record: Serialize + DeserializeOwned + Clone {
+    /// Unique table name for this record type (e.g., "plans", "users")
+    fn table_name() -> &'static str;
+
+    /// Get the unique ID for this record
+    fn id(&self) -> &str;
+
+    /// Get the last updated timestamp (Unix ms)
+    fn updated_at(&self) -> i64;
+
+    /// Define the SQLite schema for this record type
+    fn schema() -> &'static str;
+
+    /// Convert record to SQL parameter tuple for INSERT/UPDATE
+    fn to_params(&self) -> Vec<Box<dyn rusqlite::ToSql>>;
+
+    /// Construct record from SQL row
+    fn from_row(row: &rusqlite::Row) -> Result<Self>;
+}
+```
+
+#### Example: Plan Record
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Plan {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub status: PlanStatus,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlanStatus {
+    Draft,
+    Active,
+    Complete,
+}
+
+impl Record for Plan {
+    fn table_name() -> &'static str { "plans" }
+    fn id(&self) -> &str { &self.id }
+    fn updated_at(&self) -> i64 { self.updated_at }
+
+    fn schema() -> &'static str {
+        r#"
+        CREATE TABLE plans (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            content TEXT NOT NULL
+        );
+        CREATE INDEX idx_plans_status ON plans(status);
+        "#
+    }
+
+    fn to_params(&self) -> Vec<Box<dyn rusqlite::ToSql>> {
+        vec![
+            Box::new(self.id.clone()),
+            Box::new(self.title.clone()),
+            Box::new(self.description.clone()),
+            Box::new(self.created_at),
+            Box::new(self.updated_at),
+            Box::new(format!("{:?}", self.status).to_lowercase()),
+            Box::new(self.content.clone()),
+        ]
+    }
+
+    fn from_row(row: &rusqlite::Row) -> Result<Self> {
+        Ok(Plan {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            description: row.get(2)?,
+            created_at: row.get(3)?,
+            updated_at: row.get(4)?,
+            status: match row.get::<_, String>(5)?.as_str() {
+                "draft" => PlanStatus::Draft,
+                "active" => PlanStatus::Active,
+                "complete" => PlanStatus::Complete,
+                _ => return Err(eyre!("Invalid status")),
+            },
+            content: row.get(6)?,
+        })
+    }
+}
+```
+
+#### Example: User Record
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct User {
+    pub id: String,
+    pub username: String,
+    pub email: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub active: bool,
+}
+
+impl Record for User {
+    fn table_name() -> &'static str { "users" }
+    fn id(&self) -> &str { &self.id }
+    fn updated_at(&self) -> i64 { self.updated_at }
+
+    fn schema() -> &'static str {
+        r#"
+        CREATE TABLE users (
+            id TEXT PRIMARY KEY,
+            username TEXT NOT NULL UNIQUE,
+            email TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            active INTEGER NOT NULL
+        );
+        CREATE INDEX idx_users_username ON users(username);
+        CREATE INDEX idx_users_active ON users(active);
+        "#
+    }
+
+    fn to_params(&self) -> Vec<Box<dyn rusqlite::ToSql>> {
+        vec![
+            Box::new(self.id.clone()),
+            Box::new(self.username.clone()),
+            Box::new(self.email.clone()),
+            Box::new(self.created_at),
+            Box::new(self.updated_at),
+            Box::new(self.active as i64),
+        ]
+    }
+
+    fn from_row(row: &rusqlite::Row) -> Result<Self> {
+        Ok(User {
+            id: row.get(0)?,
+            username: row.get(1)?,
+            email: row.get(2)?,
+            created_at: row.get(3)?,
+            updated_at: row.get(4)?,
+            active: row.get::<_, i64>(5)? != 0,
+        })
+    }
+}
+```
+
 #### Directory Structure
 
 ```
 .taskstore/
 ├── taskstore.db           # SQLite database (fast queries)
-├── prds.jsonl             # PRD records (one per line)
-├── task_specs.jsonl       # Task spec records
-├── executions.jsonl       # Execution state records
-├── dependencies.jsonl     # Dependency records
-├── workflows.jsonl        # AWL workflow definitions
-├── repo_state.jsonl       # Per-repo metadata (last_synced_commit, etc.)
+├── plans.jsonl            # Plan records (one per line)
+├── users.jsonl            # User records
+├── tasks.jsonl            # Task records
+├── events.jsonl           # Event records
 ├── taskstore.log          # Structured log output (rotated)
 └── .version               # Schema version marker
 ```
 
-#### SQLite Schema
+#### Generic SQLite Schema
+
+The library maintains a generic registry of tables:
 
 ```sql
--- Product Requirements Documents
-CREATE TABLE prds (
-    id TEXT PRIMARY KEY,              -- UUIDv7 (sortable)
-    title TEXT NOT NULL,
-    description TEXT NOT NULL,
-    created_at INTEGER NOT NULL,      -- Unix timestamp (ms)
-    updated_at INTEGER NOT NULL,
-    status TEXT NOT NULL,             -- 'draft' | 'active' | 'complete'
-    review_passes INTEGER NOT NULL,   -- Rule of Five tracking
-    content TEXT NOT NULL             -- Full PRD markdown
+-- Generic record storage
+CREATE TABLE records (
+    table_name TEXT NOT NULL,      -- e.g., "plans", "users"
+    id TEXT NOT NULL,               -- Record ID
+    data TEXT NOT NULL,             -- Full JSON record
+    updated_at INTEGER NOT NULL,    -- Unix timestamp (ms)
+    PRIMARY KEY (table_name, id)
 );
 
--- Task Specifications (decomposed from PRDs)
-CREATE TABLE task_specs (
-    id TEXT PRIMARY KEY,              -- UUIDv7 (sortable)
-    prd_id TEXT NOT NULL,             -- FK to prds.id
-    phase_name TEXT NOT NULL,         -- e.g., "Phase 1: Core Logic"
-    description TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    status TEXT NOT NULL,             -- 'pending' | 'running' | 'complete' | 'failed'
-    workflow_name TEXT,               -- Which AWL workflow to use (e.g., "rust-development")
-    assigned_to TEXT,                 -- Execution ID if assigned
-    content TEXT NOT NULL,            -- Task spec markdown
-    FOREIGN KEY (prd_id) REFERENCES prds(id) ON DELETE CASCADE
-);
+-- Index for common queries
+CREATE INDEX idx_records_table ON records(table_name);
+CREATE INDEX idx_records_updated ON records(updated_at);
 
--- Execution State (loop instances)
-CREATE TABLE executions (
-    id TEXT PRIMARY KEY,              -- UUIDv7 (sortable)
-    ts_id TEXT NOT NULL,              -- FK to task_specs.id
-    worktree_path TEXT NOT NULL,      -- Git worktree path
-    branch_name TEXT NOT NULL,        -- Git branch name
-    status TEXT NOT NULL,             -- 'running' | 'paused' | 'complete' | 'failed' | 'stopped'
-    started_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    completed_at INTEGER,             -- NULL if not complete
-    current_phase TEXT,               -- Current foreach iteration
-    iteration_count INTEGER NOT NULL DEFAULT 0,
-    error_message TEXT,               -- NULL if no error
-    FOREIGN KEY (ts_id) REFERENCES task_specs(id) ON DELETE CASCADE
-);
-
--- Dependencies (coordination)
-CREATE TABLE dependencies (
-    id TEXT PRIMARY KEY,              -- UUIDv7 (sortable)
-    from_exec_id TEXT NOT NULL,       -- Execution that depends
-    to_exec_id TEXT NOT NULL,         -- Execution depended upon
-    dependency_type TEXT NOT NULL,    -- 'notify' | 'query' | 'share'
-    created_at INTEGER NOT NULL,
-    resolved_at INTEGER,              -- NULL if not resolved
-    payload TEXT,                     -- JSON payload for share/query
-    FOREIGN KEY (from_exec_id) REFERENCES executions(id) ON DELETE CASCADE,
-    FOREIGN KEY (to_exec_id) REFERENCES executions(id) ON DELETE CASCADE
-);
-
--- AWL Workflow Definitions
-CREATE TABLE workflows (
-    id TEXT PRIMARY KEY,              -- UUIDv7 (sortable)
-    name TEXT NOT NULL UNIQUE,        -- e.g., "rust-development"
-    version TEXT NOT NULL,            -- Semantic version
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    content TEXT NOT NULL             -- Full YAML workflow definition
-);
-
--- Repository State (per-repo metadata)
-CREATE TABLE repo_state (
-    repo_path TEXT PRIMARY KEY,       -- Absolute path to repo root
-    last_synced_commit TEXT NOT NULL, -- Git SHA of main when last synced
-    updated_at INTEGER NOT NULL
-);
-
--- Indexes for common queries
-CREATE INDEX idx_prds_status ON prds(status);
-CREATE INDEX idx_task_specs_prd_id ON task_specs(prd_id);
-CREATE INDEX idx_task_specs_status ON task_specs(status);
-CREATE INDEX idx_executions_ts_id ON executions(ts_id);
-CREATE INDEX idx_executions_status ON executions(status);
-CREATE INDEX idx_dependencies_from ON dependencies(from_exec_id);
-CREATE INDEX idx_dependencies_to ON dependencies(to_exec_id);
-CREATE INDEX idx_workflows_name ON workflows(name);
+-- Type-specific tables are created dynamically via Record::schema()
 ```
+
+When you register a type, its specific table is created using the schema from `Record::schema()`.
 
 #### JSONL Format
 
 Each JSONL file contains one JSON object per line. Each record has a unique `id` field.
 
-**prds.jsonl example:**
+**plans.jsonl example:**
 ```jsonl
-{"id":"550e8400-e29b-41d4-a716-446655440000","title":"Add User Authentication","description":"Implement JWT-based auth...","created_at":1704067200000,"updated_at":1704067200000,"status":"active","review_passes":5,"content":"# PRD: Add User Authentication\n\n..."}
-{"id":"660e8400-e29b-41d4-a716-446655440001","title":"Database Migration Tool","description":"CLI tool for managing migrations...","created_at":1704070800000,"updated_at":1704070800000,"status":"draft","review_passes":3,"content":"# PRD: Database Migration Tool\n\n..."}
+{"id":"550e8400-e29b-41d4-a716-446655440000","title":"Launch Product","description":"Complete product launch...","created_at":1704067200000,"updated_at":1704067200000,"status":"active","content":"# Plan: Launch Product\n\n..."}
+{"id":"660e8400-e29b-41d4-a716-446655440001","title":"Migrate Database","description":"Upgrade to PostgreSQL 15...","created_at":1704070800000,"updated_at":1704070800000,"status":"draft","content":"# Plan: Migrate Database\n\n..."}
 ```
 
-**executions.jsonl example:**
+**users.jsonl example:**
 ```jsonl
-{"id":"770e8400-e29b-41d4-a716-446655440010","ts_id":"880e8400-e29b-41d4-a716-446655440020","worktree_path":"/tmp/worktrees/exec-770e8400","branch_name":"feature/auth-phase1","status":"running","started_at":1704074400000,"updated_at":1704078000000,"completed_at":null,"current_phase":"Phase 1: Core Logic","iteration_count":3,"error_message":null}
+{"id":"770e8400-e29b-41d4-a716-446655440010","username":"alice","email":"alice@example.com","created_at":1704074400000,"updated_at":1704078000000,"active":true}
+{"id":"880e8400-e29b-41d4-a716-446655440020","username":"bob","email":"bob@example.com","created_at":1704074500000,"updated_at":1704078100000,"active":true}
 ```
 
 ### API Design
@@ -261,6 +353,9 @@ impl Store {
     /// Open or create store at given path
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self>;
 
+    /// Register a record type (creates table if needed)
+    pub fn register<T: Record>(&mut self) -> Result<()>;
+
     /// Sync: Rebuild SQLite from JSONL if needed
     pub fn sync(&mut self) -> Result<()>;
 
@@ -268,215 +363,146 @@ impl Store {
     pub fn flush(&mut self) -> Result<()>;
 }
 
-// PRD operations
+// Generic CRUD operations
 impl Store {
-    pub fn create_prd(&mut self, prd: Prd) -> Result<String>; // Returns ID
-    pub fn get_prd(&self, id: &str) -> Result<Option<Prd>>;
-    pub fn update_prd(&mut self, id: &str, prd: Prd) -> Result<()>;
-    pub fn list_prds(&self, status: Option<PrdStatus>) -> Result<Vec<Prd>>;
-}
-
-// Task Spec operations
-impl Store {
-    pub fn create_task_spec(&mut self, ts: TaskSpec) -> Result<String>;
-    pub fn get_task_spec(&self, id: &str) -> Result<Option<TaskSpec>>;
-    pub fn update_task_spec(&mut self, id: &str, ts: TaskSpec) -> Result<()>;
-    pub fn list_task_specs(&self, prd_id: &str) -> Result<Vec<TaskSpec>>;
-    pub fn list_pending_task_specs(&self) -> Result<Vec<TaskSpec>>;
-}
-
-// Execution operations
-impl Store {
-    pub fn create_execution(&mut self, exec: Execution) -> Result<String>;
-    pub fn get_execution(&self, id: &str) -> Result<Option<Execution>>;
-    pub fn update_execution(&mut self, id: &str, exec: Execution) -> Result<()>;
-    pub fn list_executions(&self, status: Option<ExecStatus>) -> Result<Vec<Execution>>;
-    pub fn list_active_executions(&self) -> Result<Vec<Execution>>;
-
-    /// Complete execution and cascade PRD completion if all TSs are done
-    pub fn complete_execution(&mut self, exec_id: &str) -> Result<()> {
-        // 1. Mark execution complete
-        let exec = self.get_execution(exec_id)?.ok_or_else(|| eyre!("Execution not found"))?;
-        let mut updated_exec = exec.clone();
-        updated_exec.status = ExecStatus::Complete;
-        updated_exec.completed_at = Some(now_ms());
-        self.update_execution(exec_id, updated_exec)?;
-
-        // 2. Mark TS complete
-        let ts_id = &exec.ts_id;
-        let ts = self.get_task_spec(ts_id)?.ok_or_else(|| eyre!("TaskSpec not found"))?;
-        let mut updated_ts = ts.clone();
-        updated_ts.status = TaskSpecStatus::Complete;
-        updated_ts.updated_at = now_ms();
-        self.update_task_spec(ts_id, updated_ts)?;
-
-        // 3. Check if all TSs for PRD are complete
-        let prd_id = &ts.prd_id;
-        let all_ts = self.list_task_specs(prd_id)?;
-
-        if all_ts.iter().all(|ts| ts.status == TaskSpecStatus::Complete) {
-            // 4. Mark PRD complete
-            let prd = self.get_prd(prd_id)?.ok_or_else(|| eyre!("PRD not found"))?;
-            let mut updated_prd = prd.clone();
-            updated_prd.status = PrdStatus::Complete;
-            updated_prd.updated_at = now_ms();
-            self.update_prd(prd_id, updated_prd)?;
-        }
-
-        Ok(())
+    /// Create a new record
+    pub fn create<T: Record>(&mut self, record: T) -> Result<String> {
+        // Returns record ID
     }
+
+    /// Get record by ID
+    pub fn get<T: Record>(&self, id: &str) -> Result<Option<T>>;
+
+    /// Update existing record
+    pub fn update<T: Record>(&mut self, id: &str, record: T) -> Result<()>;
+
+    /// Delete record by ID
+    pub fn delete<T: Record>(&mut self, id: &str) -> Result<()>;
+
+    /// List all records of type T
+    pub fn list<T: Record>(&self) -> Result<Vec<T>>;
+
+    /// List records matching a filter
+    pub fn list_filtered<T: Record>(&self, filter: Filter) -> Result<Vec<T>>;
+
+    /// List records with pagination
+    pub fn list_paginated<T: Record>(
+        &self,
+        filter: Option<Filter>,
+        limit: usize,
+        offset: usize
+    ) -> Result<Vec<T>>;
+
+    /// Count records matching filter
+    pub fn count<T: Record>(&self, filter: Option<Filter>) -> Result<usize>;
 }
 
-// Dependency operations
-impl Store {
-    pub fn create_dependency(&mut self, dep: Dependency) -> Result<String>;
-    pub fn get_dependency(&self, id: &str) -> Result<Option<Dependency>>;
-    pub fn resolve_dependency(&mut self, id: &str, payload: Option<String>) -> Result<()>;
-    pub fn list_dependencies(&self, exec_id: &str) -> Result<Vec<Dependency>>;
+// Filter builder for queries
+#[derive(Debug, Clone)]
+pub struct Filter {
+    conditions: Vec<(String, FilterOp, Box<dyn rusqlite::ToSql>)>,
 }
 
-// Data structures
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Prd {
-    pub id: String,
-    pub title: String,
-    pub description: String,
-    pub created_at: i64,
-    pub updated_at: i64,
-    pub status: PrdStatus,
-    pub review_passes: u8,
-    pub content: String,
+#[derive(Debug, Clone)]
+pub enum FilterOp {
+    Eq,      // =
+    Ne,      // !=
+    Lt,      // <
+    Lte,     // <=
+    Gt,      // >
+    Gte,     // >=
+    Like,    // LIKE
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PrdStatus {
-    Draft,
-    Active,
-    Complete,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskSpec {
-    pub id: String,
-    pub prd_id: String,
-    pub phase_name: String,
-    pub description: String,
-    pub created_at: i64,
-    pub updated_at: i64,
-    pub status: TaskSpecStatus,
-    pub assigned_to: Option<String>,
-    pub content: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TaskSpecStatus {
-    Pending,
-    Running,
-    Complete,
-    Failed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Execution {
-    pub id: String,
-    pub ts_id: String,
-    pub worktree_path: String,
-    pub branch_name: String,
-    pub status: ExecStatus,
-    pub started_at: i64,
-    pub updated_at: i64,
-    pub completed_at: Option<i64>,
-    pub current_phase: Option<String>,
-    pub iteration_count: u32,
-    pub error_message: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ExecStatus {
-    Running,
-    Paused,
-    Complete,
-    Failed,
-    Stopped,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Dependency {
-    pub id: String,
-    pub from_exec_id: String,
-    pub to_exec_id: String,
-    pub dependency_type: DependencyType,
-    pub created_at: i64,
-    pub resolved_at: Option<i64>,
-    pub payload: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DependencyType {
-    Notify,
-    Query,
-    Share,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Workflow {
-    pub id: String,
-    pub name: String,
-    pub version: String,
-    pub created_at: i64,
-    pub updated_at: i64,
-    pub content: String,  // YAML workflow definition
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RepoState {
-    pub repo_path: String,
-    pub last_synced_commit: String,  // Git SHA
-    pub updated_at: i64,
+impl Filter {
+    pub fn new() -> Self;
+    pub fn eq<T: rusqlite::ToSql>(mut self, field: &str, value: T) -> Self;
+    pub fn ne<T: rusqlite::ToSql>(mut self, field: &str, value: T) -> Self;
+    pub fn gt<T: rusqlite::ToSql>(mut self, field: &str, value: T) -> Self;
+    // ... other filter methods
 }
 ```
 
 ### Usage Examples
 
-**Creating a PRD:**
+**Creating records:**
 ```rust
-let store = Store::open(".taskstore")?;
+let mut store = Store::open(".taskstore")?;
 
-let prd = Prd {
+// Register record types
+store.register::<Plan>()?;
+store.register::<User>()?;
+
+// Create a plan
+let plan = Plan {
     id: uuid::Uuid::now_v7().to_string(),
-    title: "Add User Authentication".to_string(),
-    description: "Implement JWT-based auth system".to_string(),
+    title: "Launch Product".to_string(),
+    description: "Complete product launch".to_string(),
     created_at: now_ms(),
     updated_at: now_ms(),
-    status: PrdStatus::Draft,
-    review_passes: 0,
-    content: "# PRD: Add User Authentication\n\n...".to_string(),
+    status: PlanStatus::Draft,
+    content: "# Plan: Launch Product\n\n...".to_string(),
 };
 
-let prd_id = store.create_prd(prd)?;
-println!("Created PRD: {}", prd_id);
+let plan_id = store.create(plan)?;
+println!("Created plan: {}", plan_id);
+
+// Create a user
+let user = User {
+    id: uuid::Uuid::now_v7().to_string(),
+    username: "alice".to_string(),
+    email: "alice@example.com".to_string(),
+    created_at: now_ms(),
+    updated_at: now_ms(),
+    active: true,
+};
+
+let user_id = store.create(user)?;
+println!("Created user: {}", user_id);
 ```
 
-**Querying active executions:**
+**Querying records:**
 ```rust
-let active = store.list_active_executions()?;
-for exec in active {
-    println!("Execution {} on {}: {:?}",
-        exec.id, exec.branch_name, exec.status);
+// Get all active plans
+let active_plans = store.list_filtered::<Plan>(
+    Filter::new().eq("status", "active")
+)?;
+
+for plan in active_plans {
+    println!("Plan {}: {}", plan.id, plan.title);
+}
+
+// Get all active users
+let active_users = store.list_filtered::<User>(
+    Filter::new().eq("active", 1)
+)?;
+
+for user in active_users {
+    println!("User {}: {}", user.id, user.username);
+}
+
+// Get single record by ID
+if let Some(plan) = store.get::<Plan>("550e8400-...")? {
+    println!("Found plan: {}", plan.title);
 }
 ```
 
 **Pagination:**
 ```rust
 // Get first page (100 records)
-let page1 = store.list_executions_paginated(None, 100, 0)?;
+let page1 = store.list_paginated::<Plan>(None, 100, 0)?;
 
 // Get second page (next 100 records)
-let page2 = store.list_executions_paginated(None, 100, 100)?;
+let page2 = store.list_paginated::<Plan>(None, 100, 100)?;
+```
+
+**Updating records:**
+```rust
+if let Some(mut plan) = store.get::<Plan>("550e8400-...")? {
+    plan.status = PlanStatus::Active;
+    plan.updated_at = now_ms();
+    store.update(&plan.id, plan)?;
+}
 ```
 
 ### Merge Driver Algorithm
@@ -494,8 +520,8 @@ The `taskstore-merge` binary implements a three-way merge for JSONL files:
 
 **Example:**
 ```
-Base:    {"id":"A","updated_at":1000,"status":"running"}
-Ours:    {"id":"A","updated_at":1001,"status":"paused"}
+Base:    {"id":"A","updated_at":1000,"status":"draft"}
+Ours:    {"id":"A","updated_at":1001,"status":"active"}
 Theirs:  {"id":"A","updated_at":1002,"status":"complete"}
 Merged:  {"id":"A","updated_at":1002,"status":"complete"}  # Theirs wins (newer)
 ```
@@ -503,9 +529,9 @@ Merged:  {"id":"A","updated_at":1002,"status":"complete"}  # Theirs wins (newer)
 **Conflict example (same timestamp):**
 ```
 <<<<<<< OURS
-{"id":"B","updated_at":1500,"status":"running"}
+{"id":"B","updated_at":1500,"status":"active"}
 =======
-{"id":"B","updated_at":1500,"status":"paused"}
+{"id":"B","updated_at":1500,"status":"draft"}
 >>>>>>> THEIRS
 ```
 
@@ -538,7 +564,7 @@ JSONL files are **append-only logs**. Updates work as follows:
 2. **Result:** Multiple records with same ID, differing `updated_at` timestamps
 3. **Sync operation:** When rebuilding SQLite from JSONL, take the **latest** record per ID (highest `updated_at`)
 
-**Example prds.jsonl:**
+**Example plans.jsonl:**
 ```jsonl
 {"id":"A","title":"Feature X","status":"draft","updated_at":1000}
 {"id":"A","title":"Feature X","status":"active","updated_at":1001}
@@ -561,15 +587,20 @@ When syncing, only the last record (complete, 1002) is inserted into SQLite.
 **Write ordering:** Always write JSONL first, then SQLite.
 
 ```rust
-pub fn update_execution_and_ts(&mut self, exec_id: &str, ts_id: &str) -> Result<()> {
+pub fn update_multi<T: Record>(&mut self, records: Vec<T>) -> Result<()> {
     // 1. Write to JSONL first (source of truth)
-    self.append_jsonl("executions.jsonl", &exec)?;
-    self.append_jsonl("task_specs.jsonl", &ts)?;
+    for record in &records {
+        self.append_jsonl(T::table_name(), record)?;
+    }
 
     // 2. Then update SQLite (derived cache)
     let tx = self.db.transaction()?;
-    tx.execute("UPDATE executions SET ...", ...)?;
-    tx.execute("UPDATE task_specs SET ...", ...)?;
+    for record in &records {
+        tx.execute(
+            &format!("UPDATE {} SET ... WHERE id = ?", T::table_name()),
+            record.to_params()
+        )?;
+    }
     tx.commit()?;
 
     Ok(())
@@ -579,8 +610,6 @@ pub fn update_execution_and_ts(&mut self, exec_id: &str, ts_id: &str) -> Result<
 **Failure scenarios:**
 - **JSONL write fails:** Return error immediately, nothing written, consistent state
 - **SQLite write fails after JSONL succeeds:** SQLite is now stale, but next `sync()` will rebuild from JSONL and repair
-
-**Single-record operations:** Same ordering applies to all CRUD operations.
 
 ### Error Handling Patterns
 
@@ -602,11 +631,7 @@ pub fn update_execution_and_ts(&mut self, exec_id: &str, ts_id: &str) -> Result<
 
 **File permission denied:** Return error with context about .taskstore/ permissions
 
-**Concurrent access:** Document as unsupported - TaskDaemon is single-process, external writes are undefined behavior
-
-**Deleted git worktree:** Execution record becomes stale, TaskDaemon should detect and mark as failed
-
-**Circular dependencies:** Not validated at write time (allow for flexibility), but provide query helper to detect cycles
+**Concurrent access:** Document as unsupported - single-process only, external writes are undefined behavior
 
 ### Logging Strategy
 
@@ -619,13 +644,13 @@ use tracing::{info, warn, error};
 info!(store_path = ?self.base_path, "Opening TaskStore");
 
 // Warn: Recoverable issues
-warn!(line_no = line_num, file = "prds.jsonl", "Skipping malformed JSONL line");
+warn!(line_no = line_num, file = "plans.jsonl", "Skipping malformed JSONL line");
 
 // Error: Critical failures
 error!(error = ?e, "Failed to write JSONL, data loss possible");
 ```
 
-TaskDaemon configures tracing subscriber to write to `.taskstore/taskstore.log` for debugging.
+Applications configure tracing subscriber to write to `.taskstore/taskstore.log` for debugging.
 
 ### Edge Case: Timestamps
 
@@ -645,23 +670,23 @@ fn now_ms() -> i64 {
 ### Scale Limits and Pagination
 
 **Expected scale:**
-- **PRDs:** 10-100 concurrent PRDs per repo
-- **Task specs:** 100-1000 per PRD (10K total)
-- **Executions:** Up to 50 concurrent, 10K historical per repo
-- **Dependencies:** Up to 500 active coordination links
+- **Records per type:** 1K-100K typical, up to 1M supported
+- **Total records:** Up to 10M across all types
+- **JSONL file size:** Up to 1GB per file before compaction recommended
+- **Record size:** Up to 10MB per record (enforced limit)
 
 **Pagination support:**
 
 ```rust
-pub fn list_executions_paginated(
+pub fn list_paginated<T: Record>(
     &self,
-    status: Option<ExecStatus>,
+    filter: Option<Filter>,
     limit: usize,
     offset: usize
-) -> Result<Vec<Execution>>;
+) -> Result<Vec<T>>;
 ```
 
-CLI and TUI use pagination for large result sets. Default limit: 100 records.
+Applications use pagination for large result sets. Default limit: 100 records.
 
 ### JSONL Compaction Strategy
 
@@ -671,11 +696,11 @@ CLI and TUI use pagination for large result sets. Default limit: 100 records.
 - Manual invocation via `taskstore compact` CLI command
 
 **Compaction algorithm:**
-1. Read entire JSONL file (e.g., `prds.jsonl`)
+1. Read entire JSONL file (e.g., `plans.jsonl`)
 2. Build map of ID → latest record (highest updated_at)
-3. Write compacted records to temporary file (e.g., `prds.jsonl.tmp`)
+3. Write compacted records to temporary file (e.g., `plans.jsonl.tmp`)
 4. Fsync temporary file to disk
-5. Atomically rename: `rename("prds.jsonl.tmp", "prds.jsonl")`
+5. Atomically rename: `rename("plans.jsonl.tmp", "plans.jsonl")`
 6. Trigger sync() to rebuild SQLite
 
 **Atomicity:** `rename()` is atomic on POSIX filesystems. If compaction crashes mid-way, original file is preserved.
@@ -690,11 +715,8 @@ TaskStore exposes metrics for monitoring:
 pub struct StoreMetrics {
     pub write_latency_ms: f64,       // Exponential moving average of last 100 writes
     pub sync_duration_ms: f64,       // Duration of last sync() call
-    pub prd_count: usize,            // COUNT(*) from prds table
-    pub task_spec_count: usize,
-    pub execution_count: usize,
-    pub prds_jsonl_size_mb: f64,     // fs::metadata().len() / 1MB
-    pub executions_jsonl_size_mb: f64,
+    pub record_counts: HashMap<String, usize>,  // Count per table
+    pub jsonl_sizes_mb: HashMap<String, f64>,   // Size per JSONL file
 }
 
 impl Store {
@@ -709,8 +731,8 @@ impl Store {
 - File sizes: Queried on-demand via fs::metadata()
 
 **Usage:**
-- TaskDaemon calls `store.metrics()` every 5 seconds for TUI status bar
-- Optional: Expose via Prometheus endpoint for monitoring
+- Applications call `store.metrics()` periodically for monitoring
+- Optional: Expose via Prometheus endpoint for dashboards
 
 ### Backup and Restore Strategy
 
@@ -727,57 +749,25 @@ impl Store {
 
 **Git-based backup (recommended):**
 - .gitignore: `taskstore.db` and `taskstore.log`
-- Commit JSONL files: `prds.jsonl`, `executions.jsonl`, etc.
+- Commit JSONL files: `plans.jsonl`, `users.jsonl`, etc.
 - Push to remote for off-machine backup
 
-### TaskDaemon Integration and Coordination
+### Git Integration
 
-**Store ownership:**
-- TaskDaemon creates single Store instance at startup
-- Actor pattern: State manager task owns Store, other tasks send messages
-- Store lives for entire TaskDaemon lifetime
-
-**Actor pattern detail:**
-```rust
-// State manager task (owns Store)
-tokio::spawn(async move {
-    let mut store = Store::open(".taskstore")?;
-    loop {
-        match rx.recv().await {
-            StoreMessage::CreateExecution(exec, reply_tx) => {
-                let result = store.create_execution(exec);
-                reply_tx.send(result).await;
-            }
-            StoreMessage::UpdateExecution(id, exec, reply_tx) => {
-                let result = store.update_execution(&id, exec);
-                reply_tx.send(result).await;
-            }
-            // ... other message types
-        }
-    }
-});
-
-// Loop tasks send messages to state manager
-let (store_tx, store_rx) = mpsc::channel(100);
-let (reply_tx, reply_rx) = oneshot::channel();
-store_tx.send(StoreMessage::CreateExecution(exec, reply_tx)).await?;
-let exec_id = reply_rx.await??;
-```
+**Store lifetime:**
+- Application creates single Store instance at startup
+- Store lives for entire application lifetime
+- On shutdown, call `store.flush()` to ensure persistence
 
 **Change notification:**
 - TaskStore is passive (no pub/sub, no watchers)
-- TaskDaemon polls Store periodically or after known writes
-- For real-time coordination, TaskDaemon uses in-memory channels, Store provides durable backup
+- Applications poll Store periodically or after known writes
+- For real-time coordination, use in-memory channels with Store as durable backup
 
 **Multi-repo support:**
 - Each repo has its own `.taskstore/` directory at repo root
-- TaskDaemon can manage multiple repos, opens one Store per repo
+- Applications can manage multiple repos, opens one Store per repo
 - Store path: `<repo_root>/.taskstore/`
-
-**Proactive rebase detection:**
-- repo_state table tracks `last_synced_commit` (main branch HEAD SHA)
-- Periodically query `git rev-parse main`, compare to stored SHA
-- If different, trigger proactive rebase flow (notify all executions)
 
 ### Schema Migration Strategy
 
@@ -794,8 +784,11 @@ The `.version` file contains current schema version as integer (e.g., `1`).
 const CURRENT_VERSION: u32 = 2;
 
 fn migrate_1_to_2(store: &mut Store) -> Result<()> {
-    // Add new column to executions table
-    store.db.execute("ALTER TABLE executions ADD COLUMN priority INTEGER DEFAULT 0", [])?;
+    // Add new column to existing table
+    store.db.execute(
+        "ALTER TABLE plans ADD COLUMN priority INTEGER DEFAULT 0",
+        []
+    )?;
     // Rebuild from JSONL to populate new column with defaults
     store.sync()?;
     Ok(())
@@ -806,35 +799,46 @@ fn migrate_1_to_2(store: &mut Store) -> Result<()> {
 
 ### Implementation Plan
 
-#### Phase 1: Core Library Structure
+#### Phase 1: Generic Record Trait and Core Structure
+- Define `Record` trait with required methods
 - Create `taskstore` crate with library + binary structure:
-  - `src/lib.rs` - Main library exports (pub use Store, models, etc.)
-  - `src/store.rs` - Store implementation
-  - `src/models.rs` - Data structures (Prd, TaskSpec, Execution, Dependency)
+  - `src/lib.rs` - Main library exports (pub use Store, Record, Filter, etc.)
+  - `src/store.rs` - Generic Store implementation
+  - `src/record.rs` - Record trait definition
+  - `src/filter.rs` - Filter builder for queries
   - `src/jsonl.rs` - JSONL read/write operations
   - `src/sqlite.rs` - SQLite operations
-  - `src/bin/taskstore.rs` - Thin CLI binary that uses the library
+  - `src/bin/taskstore.rs` - CLI binary
 - Update Cargo.toml with `[lib]` and `[[bin]]` sections
-- Define all data structures with proper serde derives
 - Implement basic Store::open() with staleness check and sync()
 - Add directory structure creation (.taskstore/ with .gitignore for .db file)
 - Implement schema version tracking and migration framework
 
-#### Phase 2: SQLite Implementation
-- Write SQL schema creation
-- Implement PRD CRUD operations
-- Implement TaskSpec CRUD operations
-- Implement Execution CRUD operations
-- Implement Dependency CRUD operations
-- Add indexes for common queries
+#### Phase 2: Generic CRUD Operations
+- Implement `create<T: Record>()` method
+- Implement `get<T: Record>()` method
+- Implement `update<T: Record>()` method
+- Implement `delete<T: Record>()` method
+- Implement `list<T: Record>()` method
+- Implement `register<T: Record>()` for dynamic table creation
+- Add automatic table creation from `Record::schema()`
 
-#### Phase 3: JSONL Persistence
+#### Phase 3: Filter and Query System
+- Implement Filter builder with operator support
+- Implement `list_filtered<T: Record>()` method
+- Implement `list_paginated<T: Record>()` method
+- Implement `count<T: Record>()` method
+- Add SQLite prepared statements for efficiency
+- Add query result caching (optional)
+
+#### Phase 4: JSONL Persistence
 - Implement write-through: Every SQL write appends to JSONL
 - Implement sync: Rebuild SQLite from JSONL if stale
 - Add timestamp-based staleness detection
 - Handle JSONL file rotation if files grow too large (future)
+- Implement compaction strategy
 
-#### Phase 4: Git Merge Driver
+#### Phase 5: Git Merge Driver
 - Write `taskstore-merge` binary that takes 3 args: base, ours, theirs file paths
 - Implement line-by-line merge using unique IDs and updated_at timestamps
 - Handle conflict resolution: manual markers if timestamps equal
@@ -864,7 +868,7 @@ impl Store {
 }
 ```
 
-#### Phase 5: Git Hooks
+#### Phase 6: Git Hooks
 - Write hook scripts that shell out to `taskstore sync`
 - Install hooks to `.git/hooks/` (make executable)
 - Hook content:
@@ -885,52 +889,54 @@ Installation via `store.install_git_integration()` or manual:
 taskstore install-hooks
 ```
 
-#### Phase 6: CLI Tool
+#### Phase 7: CLI Tool
 - Add `taskstore` binary for manual inspection
 - Commands:
-  - `taskstore list-prds [--status STATUS]` - List PRDs with optional status filter
-  - `taskstore list-task-specs [--prd-id ID]` - List task specs, optionally for one PRD
-  - `taskstore list-executions [--status STATUS] [--limit N] [--offset N]` - Paginated execution list
-  - `taskstore show <id>` - Show detailed record by ID (auto-detects table)
+  - `taskstore list <type> [--filter KEY=VALUE] [--limit N] [--offset N]` - List records by type
+  - `taskstore show <type> <id>` - Show detailed record by ID and type
   - `taskstore sync` - Force rebuild SQLite from JSONL
-  - `taskstore compact` - Compact JSONL files (remove superseded records)
+  - `taskstore compact [<type>]` - Compact JSONL files (all or specific type)
   - `taskstore metrics` - Display store metrics (record counts, file sizes, latencies)
   - `taskstore backup <dest>` - Copy JSONL files to destination directory
   - `taskstore install-hooks` - Install git hooks and merge driver
+  - `taskstore register <type>` - Register a new record type (requires schema)
 - Pretty-printed output using colored terminal output (colored crate)
 
 **Example CLI output:**
 
 ```
-$ taskstore list-executions --status running
-ID                                      TS                 Branch                 Status    Phase
-────────────────────────────────────────────────────────────────────────────────────────────────────
-01928374-abcd-7000-a123-456789012345   01928374-...       feature/auth-phase1    running   Phase 2
-01928375-beef-7000-a456-789012345678   01928375-...       feature/db-migration   running   Phase 1
+$ taskstore list plans --filter status=active
+ID                                      Title                  Status    Updated
+────────────────────────────────────────────────────────────────────────────────
+01928374-abcd-7000-a123-456789012345   Launch Product         active    2026-01-14
+01928375-beef-7000-a456-789012345678   Migrate Database       active    2026-01-14
 
 $ taskstore metrics
 TaskStore Metrics
 ─────────────────────────────────────
-PRDs:              42
-Task Specs:        387
-Executions:        12 (8 running, 4 complete)
-Dependencies:      23
+Tables:
+  plans:         42 records
+  users:         87 records
+  tasks:         234 records
+  events:        1,543 records
 
 Write Latency:     0.8ms (avg)
 Sync Duration:     127ms (last)
 
 JSONL File Sizes:
-  prds.jsonl:        8.4 MB
-  executions.jsonl:  2.1 MB
-  task_specs.jsonl:  15.7 MB
+  plans.jsonl:     8.4 MB
+  users.jsonl:     2.1 MB
+  tasks.jsonl:     15.7 MB
+  events.jsonl:    42.3 MB
 ```
 
-#### Phase 7: Testing & Docs
+#### Phase 8: Testing & Documentation
 - Unit tests for all CRUD operations
 - Integration tests for sync behavior
 - Test merge driver with conflicting JSONL files
-- Write comprehensive README.md
+- Write comprehensive README.md with examples
 - Add rustdoc comments to all public APIs
+- Create example applications demonstrating Record trait implementation
 
 ## Alternatives Considered
 
@@ -944,13 +950,13 @@ JSONL File Sizes:
 - **Description:** Store everything as JSONL, parse on every query
 - **Pros:** Git-native, human-readable, simple implementation
 - **Cons:** Slow queries (O(n) scans), no indexing, poor performance at scale
-- **Why not chosen:** Unacceptable performance for "list all active executions" queries
+- **Why not chosen:** Unacceptable performance for filtered lookups and pagination
 
 ### Alternative 3: Use Beads
 - **Description:** Adopt Beads as the datastore
 - **Pros:** Already exists, proven merge driver, community support
 - **Cons:** Slow, invasive (auto-push), overcomplicated API, poor UX, one-per-line beads clutter git
-- **Why not chosen:** TaskDaemon needs cleaner, simpler, less invasive storage
+- **Why not chosen:** Need cleaner, simpler, less invasive storage for generic use cases
 
 ### Alternative 4: Use Engram
 - **Description:** Fork Engram and restore git integration
@@ -962,7 +968,13 @@ JSONL File Sizes:
 - **Description:** Store all state changes as append-only event log
 - **Pros:** Full history, time-travel debugging, audit trail
 - **Cons:** Complexity overkill, slower queries, much larger storage footprint
-- **Why not chosen:** TaskDaemon doesn't need full event sourcing; current state is sufficient
+- **Why not chosen:** Most applications don't need full event sourcing; current state is sufficient
+
+### Alternative 6: Domain-Specific Libraries
+- **Description:** Build a custom storage library for each application domain (e.g., project-management-specific, user-management-specific)
+- **Pros:** Can optimize for specific use cases, simpler API for domain
+- **Cons:** Code duplication, maintenance burden, reinventing the wheel
+- **Why not chosen:** Generic infrastructure enables reuse across projects, reduces maintenance
 
 ## Technical Considerations
 
@@ -1012,11 +1024,13 @@ JSONL File Sizes:
 - Test sync logic with stale/fresh SQLite
 - Test JSONL append and read
 - Test timestamp staleness detection
+- Test Record trait implementations
 
 **Integration tests:**
 - Create store, write records, close, reopen, verify persistence
 - Simulate git merge conflict, test merge driver
 - Trigger git hooks, verify sync is called
+- Test multiple record types in same store
 
 **Performance tests:**
 - Benchmark CRUD operations with 10K, 100K, 1M records
@@ -1029,11 +1043,11 @@ JSONL File Sizes:
 - Build taskstore as standalone crate
 - Test in isolation with unit/integration tests
 
-**Phase 2: TaskDaemon integration**
-- Add taskstore as git dependency in TaskDaemon Cargo.toml
-- Replace in-memory state with Store calls
+**Phase 2: Example applications**
+- Create sample apps using different Record types
+- Validate API ergonomics and flexibility
 
-**Phase 3: Git integration setup**
+**Phase 3: Git integration testing**
 - Document merge driver installation steps
 - Provide hook installation helper
 - Test with multiple concurrent git worktrees
@@ -1048,29 +1062,90 @@ JSONL File Sizes:
 | Risk | Likelihood | Impact | Mitigation |
 |------|------------|--------|------------|
 | Merge driver conflicts not handled correctly | Medium | High | Thorough testing with real merge scenarios, fall back to manual conflict markers if tie |
-| JSONL files grow too large (GBs) | Low | Medium | Implement file rotation/archiving after threshold, keep only recent N records |
+| JSONL files grow too large (GBs) | Low | Medium | Implement compaction after threshold, keep only recent versions |
 | SQLite corruption | Low | High | Always rebuild from JSONL (source of truth), keep SQLite in .gitignore |
 | Dual-write inconsistency (JSONL succeeds, SQLite fails) | Low | Medium | SQLite becomes stale, next sync() rebuilds and repairs automatically |
 | Hook installation issues on different platforms | Medium | Low | Provide clear installation instructions, test on Linux/Mac/Windows |
-| Performance degradation at scale | Medium | Medium | Profile early, add caching layer if needed, consider archiving old data |
-| Concurrent writes from multiple processes | Low | High | Document: TaskDaemon is single-process, external writes are undefined behavior |
-| Concurrent git operations during write | Medium | Medium | Document: Avoid git operations while TaskDaemon is running, or pause executions first |
+| Performance degradation at scale | Medium | Medium | Profile early, add caching layer if needed, implement compaction |
+| Concurrent writes from multiple processes | Low | High | Document: Single-process only, external writes are undefined behavior |
+| Concurrent git operations during write | Medium | Medium | Document: Avoid git operations during writes, or use store.flush() first |
 | UUIDv7 collision | Very Low | High | Check for duplicates before insert, return error if collision detected |
 | Record size exceeds memory limits | Low | Medium | Enforce 10MB per-record limit, reject writes that exceed threshold |
+| Type confusion (reading wrong type from table) | Low | High | Store type name in registry, validate on read operations |
 
 ## Open Questions
 
-- [ ] Should we archive old completed PRDs/executions automatically?
+- [ ] Should we archive old records automatically based on age?
 - [ ] How large can JSONL files grow before we need rotation?
 - [ ] Should TaskStore support multi-process access (e.g., file locking)?
 - [ ] Do we need a vacuum/cleanup operation for SQLite?
 - [ ] Should we support JSON schema validation for JSONL records?
+- [ ] Should we provide built-in relationships between record types (foreign keys)?
 
 ## References
 
 - Engram architecture: `~/.config/pais/research/tech/engram-vs-beads/2026-01-12-comparison.md`
 - Accidental minimalism lesson: `~/.config/pais/research/tech/engram-vs-beads/2026-01-12-accidental-minimalism.md`
-- TaskDaemon design: `../../taskdaemon/docs/taskdaemon-design.md`
-- AWL Schema design: `../../taskdaemon/docs/awl-schema-design.md`
 - SQLite WAL mode: https://www.sqlite.org/wal.html
 - JSONL format: https://jsonlines.org/
+- UUIDv7 specification: https://www.ietf.org/archive/id/draft-peabody-dispatch-new-uuid-format-04.html
+
+## Rule of Five Review
+
+### Review Pass 1: Core Design Clarity
+**Question:** Is the generic Record trait design clear and flexible enough for diverse use cases?
+
+**Assessment:** Yes. The Record trait provides a clean abstraction:
+- `table_name()` enables multi-type storage
+- `id()` and `updated_at()` support merge logic
+- `schema()` allows custom table definitions
+- `to_params()` and `from_row()` handle SQLite mapping
+
+The trait is minimal yet sufficient for CRUD + merging.
+
+**Concerns:** Type safety between JSONL and SQLite could be stronger. Consider adding runtime validation.
+
+### Review Pass 2: API Ergonomics
+**Question:** Are the generic APIs intuitive for library consumers?
+
+**Assessment:** Good. The `create<T>()`, `get<T>()`, `list<T>()` pattern is familiar to Rust developers. Filter builder provides flexible querying without SQL injection risks.
+
+**Improvement:** Add example implementations for common patterns (enums, nested structs, optional fields).
+
+**Concern:** Error messages for schema mismatches need to be clear and actionable.
+
+### Review Pass 3: Git Integration Robustness
+**Question:** Will the merge driver handle real-world git workflows reliably?
+
+**Assessment:** Design is sound:
+- Timestamp-based conflict resolution handles most cases
+- Manual markers for ties preserve data integrity
+- Append-only JSONL reduces conflict frequency
+
+**Risk:** Complex multi-person workflows need thorough testing. Document best practices (e.g., always pull before starting work).
+
+### Review Pass 4: Performance at Scale
+**Question:** Will the dual-write pattern and sync operations scale to production workloads?
+
+**Assessment:** Reasonable for expected scales:
+- 1ms writes acceptable for most applications
+- 100ms sync for 10K records is manageable
+- JSONL compaction keeps files under control
+
+**Optimization opportunity:** Add write batching API for bulk inserts (avoid N separate JSONL appends).
+
+**Concern:** Large records (multi-MB) could slow sync. Document recommended record size limits.
+
+### Review Pass 5: Documentation and Examples
+**Question:** Is there sufficient documentation for developers to adopt this library?
+
+**Assessment:** Design doc is comprehensive, but needs:
+- Step-by-step tutorial for implementing Record trait
+- Example repo with Plan/User/Task/Event types
+- Migration guide for applications using ad-hoc storage
+- Troubleshooting guide for common issues (merge conflicts, sync failures)
+
+**Action items:**
+- Create examples/ directory with sample Record implementations
+- Write CONTRIBUTING.md for adding new features
+- Add FAQ section to README

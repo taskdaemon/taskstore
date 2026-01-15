@@ -1,6 +1,6 @@
 # TaskStore Documentation
 
-TaskStore is a Rust library providing durable, git-integrated persistent storage using the SQLite+JSONL+Git pattern (Bead Store pattern from Gas Town).
+TaskStore is a generic Rust library providing durable, git-integrated persistent storage using the SQLite+JSONL+Git pattern (Bead Store pattern).
 
 ## Documentation Structure
 
@@ -14,37 +14,70 @@ TaskStore is a Rust library providing durable, git-integrated persistent storage
 
 ### Read This First
 
-If you're implementing TaskStore, read in this order:
+If you're using TaskStore, read in this order:
 
 1. **[storage-architecture.md](./storage-architecture.md)** - Understand the Bead Store pattern
 2. **[taskstore-design.md](./taskstore-design.md)** - Full design (API, schema, alternatives)
-3. **[implementation-guide.md](./implementation-guide.md)** - How to actually build it
+3. **[implementation-guide.md](./implementation-guide.md)** - How to actually use it
 
 ### Quick Reference
 
 **What is TaskStore?**
-- Library + binary for persistent state management
+- Generic library + binary for persistent state management
 - SQLite (fast queries) + JSONL (git-friendly) + Custom merge driver
-- Stores PRDs, Task Specs, Executions, Dependencies, Workflows
+- Works with any type implementing the `Record` trait
 
 **Key Features:**
 - Append-only JSONL (source of truth)
 - Rebuildable SQLite cache
 - Custom git merge driver for conflict resolution
 - Git hooks for automatic sync
+- Generic: no domain-specific types
 
 **API Overview:**
 ```rust
-use taskstore::{Store, Prd, TaskSpec, Execution};
+use taskstore::{Store, Record, IndexValue, Filter, FilterOp};
+use serde::{Serialize, Deserialize};
 
-let mut store = Store::open(".taskstore")?;
+// Define your own types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Plan {
+    id: String,
+    title: String,
+    status: String,
+    updated_at: i64,
+}
 
-// Create PRD
-let prd_id = store.create_prd(prd)?;
+impl Record for Plan {
+    fn id(&self) -> &str { &self.id }
+    fn updated_at(&self) -> i64 { self.updated_at }
+    fn collection_name() -> &'static str { "plans" }
+    fn indexed_fields(&self) -> HashMap<String, IndexValue> {
+        let mut fields = HashMap::new();
+        fields.insert("status".to_string(), IndexValue::String(self.status.clone()));
+        fields
+    }
+}
+
+// Use the generic API
+let mut store = Store::open(".")?;
+
+// Create
+let plan = Plan { /* ... */ };
+store.create(plan)?;
 
 // Query
-let prds = store.list_prds(Some(PrdStatus::Active))?;
-let prd = store.get_prd(&prd_id)?;
+let plans: Vec<Plan> = store.list(&[])?;
+let plan: Option<Plan> = store.get("plan-001")?;
+
+// Filter
+let active: Vec<Plan> = store.list(&[
+    Filter {
+        field: "status".to_string(),
+        op: FilterOp::Eq,
+        value: IndexValue::String("active".to_string()),
+    }
+])?;
 
 // Sync (rebuild SQLite from JSONL)
 store.sync()?;
@@ -52,31 +85,41 @@ store.sync()?;
 
 **CLI Usage:**
 ```bash
-# List operations
-taskstore list-prds --status ready
-taskstore list-executions --status running
-
 # Maintenance
 taskstore sync
-taskstore compact
 
 # Git integration
 taskstore install-hooks
 ```
 
-## Relationship to TaskDaemon
+## Using TaskStore
 
-TaskStore is consumed by [TaskDaemon](../../taskdaemon/docs/taskdaemon-design.md) as a library:
+TaskStore is consumed as a library. Define your own domain types and implement the `Record` trait:
 
+```toml
+[dependencies]
+taskstore = { path = "../taskstore" }
+serde = { version = "1.0", features = ["derive"] }
 ```
-taskdaemon/
-├── Cargo.toml              # Depends on: taskstore = { path = "../taskstore" }
-└── src/
-    └── lib.rs              # use taskstore::{Store, Prd, TaskSpec};
-```
 
-TaskDaemon orchestrates concurrent agentic loops that read/write state via TaskStore.
+```rust
+use taskstore::{Store, Record};
+
+// Your domain types implement Record
+impl Record for MyType {
+    // ...
+}
+
+// Use the generic Store
+let store = Store::open(".")?;
+store.create(my_record)?;
+```
 
 ## Status
 
-All design documents are complete (5/5 Rule of Five review passes) and ready for implementation.
+TaskStore is implemented and production-ready. All core functionality is complete:
+- ✅ Generic Record trait
+- ✅ SQLite+JSONL dual storage
+- ✅ Git merge driver
+- ✅ Filtering system
+- ✅ Collection-based storage

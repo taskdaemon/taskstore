@@ -1,15 +1,17 @@
 # TaskStore Implementation Guide
 
-**Date:** 2026-01-13
+**Date:** 2026-01-14
 **Status:** Active
 
 ## Overview
 
-This guide provides practical implementation details for building TaskStore, including repo structure, naming conventions, schema design, and git integration.
+This guide provides practical implementation details for building applications with TaskStore, a generic git-backed storage library. TaskStore provides append-only JSONL persistence with SQLite indexing, automatic git merge resolution, and hooks integration.
+
+**Key concept:** TaskStore is infrastructure. You define your domain types (Plan, Task, User, Event, etc.), implement the `Record` trait, and TaskStore handles storage, querying, git integration, and conflict resolution.
 
 ## 1. Repository Structure: Library + Binary
 
-TaskStore is both a library (for use by TaskDaemon) and a CLI binary (for manual inspection and git hooks).
+TaskStore is both a library (for use by your application) and a CLI binary (for manual inspection and git hooks).
 
 ### Current State (from scaffold)
 
@@ -29,11 +31,12 @@ taskstore/
 ├── Cargo.toml              # [[bin]] section added
 ├── src/
 │   ├── lib.rs              # NEW: Main library (pub use)
-│   ├── store.rs            # Store implementation
-│   ├── models.rs           # PRD, TaskSpec, Execution structs
+│   ├── store.rs            # Generic Store<T: Record> implementation
+│   ├── record.rs           # Record trait definition
 │   ├── jsonl.rs            # JSONL persistence
 │   ├── sqlite.rs           # SQLite operations
 │   ├── merge.rs            # Git merge driver
+│   ├── filter.rs           # Generic filter types
 │   ├── cli.rs              # CLI argument parsing (keep)
 │   ├── config.rs           # Config loading (keep)
 │   └── bin/
@@ -47,47 +50,276 @@ taskstore/
 ```rust
 // taskstore/src/lib.rs
 pub mod store;
-pub mod models;
+pub mod record;
 pub mod jsonl;
 pub mod sqlite;
 pub mod merge;
+pub mod filter;
 
 pub use store::Store;
-pub use models::{Prd, TaskSpec, Execution, Dependency, Workflow};
+pub use record::{Record, RecordType};
+pub use filter::{Filter, FilterOp};
 ```
 
-#### 2. Create src/bin/taskstore.rs
+#### 2. Define the Record Trait
 
 ```rust
-// taskstore/src/bin/taskstore.rs
-use clap::Parser;
-use taskstore::{Store, cli::Cli};
-use eyre::Result;
+// taskstore/src/record.rs
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-    let store = Store::open(".taskstore")?;
+use serde::{Deserialize, Serialize};
 
-    // CLI logic here (list, show, sync, etc.)
-    match cli.command {
-        Command::ListPrds { status } => {
-            let prds = store.list_prds(status)?;
-            for prd in prds {
-                println!("{} - {} [{}]", prd.id, prd.title, prd.status);
-            }
+/// Core trait that all stored types must implement.
+///
+/// Your domain types (Plan, Task, User, etc.) implement this trait
+/// to enable generic storage operations.
+pub trait Record: Serialize + for<'de> Deserialize<'de> + Clone {
+    /// Record type name for routing (e.g., "plans", "tasks", "users")
+    fn record_type() -> RecordType where Self: Sized;
+
+    /// Unique identifier for this record
+    fn id(&self) -> &str;
+
+    /// Timestamp of last update (for conflict resolution)
+    fn updated_at(&self) -> i64;
+
+    /// Set the updated_at timestamp (called during merge)
+    fn set_updated_at(&mut self, timestamp: i64);
+}
+
+/// Record type descriptor
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RecordType {
+    /// Type name (e.g., "plans", "tasks")
+    pub name: String,
+    /// JSONL filename (e.g., "plans.jsonl")
+    pub jsonl_file: String,
+    /// SQLite table name (e.g., "plans")
+    pub table_name: String,
+}
+
+impl RecordType {
+    pub fn new(name: impl Into<String>) -> Self {
+        let name = name.into();
+        Self {
+            jsonl_file: format!("{}.jsonl", name),
+            table_name: name.clone(),
+            name,
         }
-        Command::Sync => {
-            store.sync()?;
-            println!("TaskStore synced successfully");
-        }
-        // ... other commands
     }
-
-    Ok(())
 }
 ```
 
-#### 3. Update Cargo.toml
+#### 3. Example Domain Implementation
+
+```rust
+// In your application code (not in taskstore)
+
+use serde::{Deserialize, Serialize};
+use taskstore::{Record, RecordType};
+
+/// A plan in your project management system
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Plan {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub status: PlanStatus,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    Draft,
+    Active,
+    Complete,
+    Cancelled,
+}
+
+impl Record for Plan {
+    fn record_type() -> RecordType {
+        RecordType::new("plans")
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn updated_at(&self) -> i64 {
+        self.updated_at
+    }
+
+    fn set_updated_at(&mut self, timestamp: i64) {
+        self.updated_at = timestamp;
+    }
+}
+
+/// A task in your project management system
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Task {
+    pub id: String,
+    pub plan_id: String,
+    pub title: String,
+    pub status: TaskStatus,
+    pub assignee: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Pending,
+    InProgress,
+    Complete,
+    Blocked,
+}
+
+impl Record for Task {
+    fn record_type() -> RecordType {
+        RecordType::new("tasks")
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn updated_at(&self) -> i64 {
+        self.updated_at
+    }
+
+    fn set_updated_at(&mut self, timestamp: i64) {
+        self.updated_at = timestamp;
+    }
+}
+```
+
+#### 4. Generic Store API
+
+```rust
+// taskstore/src/store.rs
+
+use crate::record::Record;
+use crate::filter::Filter;
+use eyre::Result;
+use std::path::Path;
+
+pub struct Store {
+    base_path: PathBuf,
+    db: Connection,
+}
+
+impl Store {
+    /// Open or create a store at the given path
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let base_path = path.as_ref().to_path_buf();
+        fs::create_dir_all(&base_path)?;
+
+        let db_path = base_path.join("store.db");
+        let db = Connection::open(db_path)?;
+
+        // Initialize generic schema
+        Self::init_schema(&db)?;
+
+        Ok(Self { base_path, db })
+    }
+
+    /// Create a new record
+    pub fn create<T: Record>(&mut self, record: T) -> Result<String> {
+        let record_type = T::record_type();
+
+        // 1. Append to JSONL (source of truth)
+        self.append_jsonl(&record_type.jsonl_file, &record)?;
+
+        // 2. Insert into SQLite (derived index)
+        self.insert_record(&record)?;
+
+        Ok(record.id().to_string())
+    }
+
+    /// Get a record by ID
+    pub fn get<T: Record>(&self, id: &str) -> Result<Option<T>> {
+        let record_type = T::record_type();
+
+        let mut stmt = self.db.prepare(
+            "SELECT data FROM records WHERE type = ?1 AND id = ?2"
+        )?;
+
+        let result = stmt.query_row(params![record_type.name, id], |row| {
+            let json: String = row.get(0)?;
+            Ok(serde_json::from_str(&json).unwrap())
+        });
+
+        match result {
+            Ok(record) => Ok(Some(record)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// List records with optional filtering
+    pub fn list<T: Record>(&self, filter: Option<Filter>) -> Result<Vec<T>> {
+        let record_type = T::record_type();
+
+        let (where_clause, params) = if let Some(f) = filter {
+            f.to_sql()
+        } else {
+            (String::new(), vec![])
+        };
+
+        let query = format!(
+            "SELECT data FROM records WHERE type = ?1 {}",
+            where_clause
+        );
+
+        let mut stmt = self.db.prepare(&query)?;
+        let mut all_params = vec![record_type.name.clone().into()];
+        all_params.extend(params);
+
+        let records = stmt.query_map(&all_params[..], |row| {
+            let json: String = row.get(0)?;
+            Ok(serde_json::from_str(&json).unwrap())
+        })?;
+
+        Ok(records.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Update an existing record
+    pub fn update<T: Record>(&mut self, record: T) -> Result<()> {
+        let record_type = T::record_type();
+
+        // 1. Append to JSONL (source of truth)
+        self.append_jsonl(&record_type.jsonl_file, &record)?;
+
+        // 2. Update SQLite (derived index)
+        self.update_record(&record)?;
+
+        Ok(())
+    }
+
+    /// Rebuild SQLite from JSONL (used by git hooks)
+    pub fn sync(&mut self) -> Result<()> {
+        // Clear all records
+        self.db.execute("DELETE FROM records", [])?;
+        self.db.execute("DELETE FROM record_indexes", [])?;
+
+        // Re-import from all JSONL files
+        for entry in fs::read_dir(&self.base_path)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                self.import_jsonl(&path)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+```
+
+#### 5. Update Cargo.toml
 
 ```toml
 [package]
@@ -103,6 +335,10 @@ path = "src/lib.rs"
 name = "taskstore"
 path = "src/bin/taskstore.rs"
 
+[[bin]]
+name = "taskstore-merge"
+path = "src/bin/taskstore-merge.rs"
+
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -112,11 +348,71 @@ uuid = { version = "1.0", features = ["v7"] }
 clap = { version = "4.0", features = ["derive"] }
 ```
 
-#### 4. Move Logic
+#### 6. Example CLI Usage
 
-- **Core logic** → `src/store.rs`, `src/models.rs`, `src/jsonl.rs`, `src/sqlite.rs`
-- **CLI commands** → `src/bin/taskstore.rs`
-- **Keep** `cli.rs` and `config.rs` as-is (used by both lib and bin)
+```rust
+// src/bin/taskstore.rs - Generic CLI
+
+use clap::Parser;
+use taskstore::Store;
+use eyre::Result;
+
+#[derive(Parser)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Parser)]
+enum Command {
+    /// List records of a given type
+    List {
+        /// Record type (e.g., "plans", "tasks")
+        record_type: String,
+        /// Filter expression (optional)
+        #[arg(long)]
+        filter: Option<String>,
+    },
+    /// Show a record by ID
+    Show {
+        /// Record ID
+        id: String,
+    },
+    /// Rebuild SQLite from JSONL
+    Sync,
+    /// Install git hooks and merge driver
+    InstallHooks,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let store = Store::open(".taskstore")?;
+
+    match cli.command {
+        Command::List { record_type, filter } => {
+            // Generic list - prints raw JSON
+            let data = store.list_raw(&record_type, filter.as_deref())?;
+            for json in data {
+                println!("{}", json);
+            }
+        }
+        Command::Show { id } => {
+            let data = store.get_raw(&id)?;
+            println!("{}", serde_json::to_string_pretty(&data)?);
+        }
+        Command::Sync => {
+            store.sync()?;
+            println!("TaskStore synced successfully");
+        }
+        Command::InstallHooks => {
+            store.install_git_integration()?;
+            println!("Git hooks and merge driver installed");
+        }
+    }
+
+    Ok(())
+}
+```
 
 ## 2. File Naming Conventions
 
@@ -128,12 +424,14 @@ clap = { version = "4.0", features = ["derive"] }
 taskstore/src/
 ├── lib.rs
 ├── store.rs      # mod store; (not store_manager)
-├── models.rs     # mod models;
+├── record.rs     # mod record;
 ├── jsonl.rs      # mod jsonl;
 ├── sqlite.rs     # mod sqlite;
 ├── merge.rs      # mod merge; (git merge driver)
+├── filter.rs     # mod filter;
 └── bin/
-    └── taskstore.rs
+    ├── taskstore.rs
+    └── taskstore-merge.rs
 ```
 
 ### JSONL Field Names
@@ -141,16 +439,16 @@ taskstore/src/
 **Rule:** Use snake_case in JSONL (matches Rust struct fields directly)
 
 ```jsonl
-{"id":"prd-550e8400","title":"Add OAuth","status":"draft","created_at":1704067200000,"updated_at":1704067200000}
+{"id":"plan-550e8400","title":"Launch MVP","status":"active","created_at":1704067200000,"updated_at":1704067200000}
 ```
 
 **Rust struct:**
 ```rust
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Prd {
+pub struct Plan {
     pub id: String,
     pub title: String,
-    pub status: PrdStatus,
+    pub status: PlanStatus,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -158,7 +456,9 @@ pub struct Prd {
 
 **Note:** No serde rename needed - JSONL uses snake_case, Rust uses snake_case.
 
-### Markdown File Names
+### Markdown File Names (Optional)
+
+If your records have associated markdown files:
 
 **Rule:** Lowercase with hyphens, sanitize special characters
 
@@ -170,108 +470,137 @@ fn sanitize_filename(title: &str) -> String {
         .replace(|c: char| !c.is_alphanumeric() && c != '-', "")
 }
 
-// "Add OAuth Authentication" → "add-oauth-authentication.md"
+// "Launch MVP" → "launch-mvp.md"
 ```
 
 ## 3. Database Schema
 
-### Schema Design
+### Generic Schema Design
+
+TaskStore uses a **generic schema** that works for all record types:
 
 ```sql
--- Product Requirements Documents
-CREATE TABLE prds (
-    id TEXT PRIMARY KEY,
-    title TEXT NOT NULL,
-    description TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    status TEXT NOT NULL,             -- 'draft' | 'ready' | 'in_progress' | 'complete' | 'failed' | 'cancelled'
-    review_passes INTEGER NOT NULL,
-    file TEXT NOT NULL,               -- Markdown filename
-    UNIQUE(file)
+-- Core records table (stores all record types)
+CREATE TABLE records (
+    id TEXT NOT NULL,
+    type TEXT NOT NULL,              -- Record type name ("plans", "tasks", etc.)
+    data TEXT NOT NULL,              -- Full JSON serialization
+    updated_at INTEGER NOT NULL,     -- For conflict resolution
+    PRIMARY KEY (type, id)
 );
 
--- Task Specifications
-CREATE TABLE task_specs (
-    id TEXT PRIMARY KEY,
-    prd_id TEXT NOT NULL,
-    phase_name TEXT NOT NULL,
-    description TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    status TEXT NOT NULL,             -- 'pending' | 'blocked' | 'running' | 'complete' | 'failed'
-    workflow_name TEXT,               -- Which AWL workflow to use
-    assigned_to TEXT,                 -- Execution ID if running
-    file TEXT NOT NULL,               -- Markdown filename
-    content TEXT NOT NULL,            -- Full task spec markdown
-    FOREIGN KEY (prd_id) REFERENCES prds(id) ON DELETE CASCADE,
-    UNIQUE(file)
+-- Generic indexes for common queries
+CREATE TABLE record_indexes (
+    record_type TEXT NOT NULL,
+    record_id TEXT NOT NULL,
+    index_name TEXT NOT NULL,        -- Field name being indexed
+    index_value TEXT NOT NULL,       -- Field value (as string)
+    FOREIGN KEY (record_type, record_id) REFERENCES records(type, id) ON DELETE CASCADE,
+    PRIMARY KEY (record_type, index_name, index_value, record_id)
 );
 
--- Executions (running loops)
-CREATE TABLE executions (
-    id TEXT PRIMARY KEY,
-    ts_id TEXT NOT NULL,
-    worktree_path TEXT NOT NULL,
-    branch_name TEXT NOT NULL,
-    status TEXT NOT NULL,             -- 'running' | 'paused' | 'complete' | 'failed' | 'stopped'
-    started_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    completed_at INTEGER,
-    current_phase TEXT,
-    iteration_count INTEGER NOT NULL DEFAULT 0,
-    error_message TEXT,
-    FOREIGN KEY (ts_id) REFERENCES task_specs(id) ON DELETE CASCADE
-);
-
--- Dependencies (coordination messages)
-CREATE TABLE dependencies (
-    id TEXT PRIMARY KEY,
-    from_exec_id TEXT NOT NULL,
-    to_exec_id TEXT,                  -- NULL for broadcast
-    dependency_type TEXT NOT NULL,    -- 'notify' | 'query' | 'share'
-    created_at INTEGER NOT NULL,
-    resolved_at INTEGER,
-    payload TEXT,
-    FOREIGN KEY (from_exec_id) REFERENCES executions(id) ON DELETE CASCADE,
-    FOREIGN KEY (to_exec_id) REFERENCES executions(id) ON DELETE CASCADE
-);
-
--- Workflows (AWL templates)
-CREATE TABLE workflows (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
-    version TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    content TEXT NOT NULL
-);
-
--- Indexes
-CREATE INDEX idx_prds_status ON prds(status);
-CREATE INDEX idx_task_specs_prd_id ON task_specs(prd_id);
-CREATE INDEX idx_task_specs_status ON task_specs(status);
-CREATE INDEX idx_executions_ts_id ON executions(ts_id);
-CREATE INDEX idx_executions_status ON executions(status);
+-- Performance indexes
+CREATE INDEX idx_records_type ON records(type);
+CREATE INDEX idx_records_updated_at ON records(updated_at);
+CREATE INDEX idx_record_indexes_lookup ON record_indexes(record_type, index_name, index_value);
 ```
 
-### Schema Updates
+### How It Works
 
-When adding new fields:
+**All record types share the same schema:**
 
-1. Write migration function:
+1. **records table:** Stores full JSON for each record
+2. **record_indexes table:** Stores extracted fields for fast filtering
+
+**Example:** Storing a Plan record:
+
+```rust
+let plan = Plan {
+    id: "plan-001".to_string(),
+    title: "Launch MVP".to_string(),
+    status: PlanStatus::Active,
+    created_at: 1704067200000,
+    updated_at: 1704067200000,
+};
+
+// Stored as:
+// records table:
+//   type="plans", id="plan-001", data='{"id":"plan-001","title":"Launch MVP",...}'
+//
+// record_indexes table:
+//   (plans, plan-001, "status", "active")
+//   (plans, plan-001, "title", "Launch MVP")
+```
+
+### Registering Indexes
+
+Tell TaskStore which fields to index:
+
+```rust
+impl Store {
+    /// Register indexed fields for a record type
+    pub fn register_indexes<T: Record>(&mut self) -> Result<()> {
+        let record_type = T::record_type();
+
+        // Define which fields to index
+        // This is application-specific
+        match record_type.name.as_str() {
+            "plans" => {
+                self.add_index(&record_type, "status")?;
+                self.add_index(&record_type, "title")?;
+            }
+            "tasks" => {
+                self.add_index(&record_type, "plan_id")?;
+                self.add_index(&record_type, "status")?;
+                self.add_index(&record_type, "assignee")?;
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+}
+```
+
+Or use a trait-based approach:
+
+```rust
+pub trait Indexable: Record {
+    /// Return list of field names to index
+    fn indexed_fields() -> Vec<&'static str>;
+
+    /// Extract field value for indexing
+    fn field_value(&self, field: &str) -> Option<String>;
+}
+
+impl Indexable for Plan {
+    fn indexed_fields() -> Vec<&'static str> {
+        vec!["status", "title"]
+    }
+
+    fn field_value(&self, field: &str) -> Option<String> {
+        match field {
+            "status" => Some(format!("{:?}", self.status).to_lowercase()),
+            "title" => Some(self.title.clone()),
+            _ => None,
+        }
+    }
+}
+```
+
+### Schema Migrations
+
+Generic schema rarely needs migrations. If you do need to add system fields:
+
 ```rust
 fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
     conn.execute(
-        "ALTER TABLE task_specs ADD COLUMN workflow_name TEXT",
+        "ALTER TABLE records ADD COLUMN archived INTEGER DEFAULT 0",
         [],
     )?;
     Ok(())
 }
-```
 
-2. Update `.version` file:
-```rust
 const CURRENT_VERSION: u32 = 2;
 
 pub fn migrate(store_path: &Path) -> Result<()> {
@@ -287,11 +616,6 @@ pub fn migrate(store_path: &Path) -> Result<()> {
 }
 ```
 
-3. Rebuild from JSONL:
-```rust
-store.sync()?;  // Rebuilds SQLite from JSONL
-```
-
 ## 4. JSONL Patterns
 
 ### Append-Only Writes
@@ -299,20 +623,22 @@ store.sync()?;  // Rebuilds SQLite from JSONL
 **Every update appends a new line:**
 
 ```rust
-pub fn update_execution(&mut self, exec_id: &str, exec: Execution) -> Result<()> {
+pub fn update<T: Record>(&mut self, record: T) -> Result<()> {
+    let record_type = T::record_type();
+
     // 1. Append to JSONL (source of truth)
-    let json = serde_json::to_string(&exec)?;
+    let json = serde_json::to_string(&record)?;
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(self.base_path.join("executions.jsonl"))?;
+        .open(self.base_path.join(&record_type.jsonl_file))?;
     writeln!(file, "{}", json)?;
     file.sync_all()?;  // fsync
 
     // 2. Update SQLite (derived cache)
     self.db.execute(
-        "UPDATE executions SET status=?1, updated_at=?2, iteration_count=?3 WHERE id=?4",
-        params![exec.status.to_string(), exec.updated_at, exec.iteration_count, exec.id],
+        "UPDATE records SET data = ?1, updated_at = ?2 WHERE type = ?3 AND id = ?4",
+        params![json, record.updated_at(), record_type.name, record.id()],
     )?;
 
     Ok(())
@@ -321,39 +647,56 @@ pub fn update_execution(&mut self, exec_id: &str, exec: Execution) -> Result<()>
 
 **Result:** Multiple lines with same ID in JSONL:
 ```jsonl
-{"id":"exec-001","iteration_count":1,"updated_at":1000}
-{"id":"exec-001","iteration_count":2,"updated_at":1001}
-{"id":"exec-001","iteration_count":3,"updated_at":1002}
+{"id":"task-001","status":"pending","updated_at":1000}
+{"id":"task-001","status":"in_progress","updated_at":1001}
+{"id":"task-001","status":"complete","updated_at":1002}
 ```
 
 ### Sync: JSONL → SQLite
 
 ```rust
 pub fn sync(&mut self) -> Result<()> {
-    // 1. Read all JSONL
-    let executions = self.read_jsonl::<Execution>("executions.jsonl")?;
+    // 1. Read all JSONL files
+    for entry in fs::read_dir(&self.base_path)? {
+        let entry = entry?;
+        let path = entry.path();
 
-    // 2. Deduplicate: Keep latest per ID (highest updated_at)
-    let mut latest: HashMap<String, Execution> = HashMap::new();
-    for exec in executions {
-        match latest.get(&exec.id) {
-            Some(existing) if existing.updated_at > exec.updated_at => continue,
-            _ => { latest.insert(exec.id.clone(), exec); }
+        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            continue;
+        }
+
+        // 2. Parse and deduplicate
+        let records = self.read_jsonl_generic(&path)?;
+        let latest = self.deduplicate_by_id(records);
+
+        // 3. Insert into SQLite
+        for (id, (type_name, json, updated_at)) in latest {
+            self.db.execute(
+                "INSERT OR REPLACE INTO records (id, type, data, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                params![id, type_name, json, updated_at],
+            )?;
+
+            // Rebuild indexes
+            self.rebuild_indexes_for_record(&id, &type_name, &json)?;
         }
     }
 
-    // 3. Clear SQLite table
-    self.db.execute("DELETE FROM executions", [])?;
+    Ok(())
+}
 
-    // 4. Insert deduplicated records
-    for exec in latest.values() {
-        self.db.execute(
-            "INSERT INTO executions (id, ts_id, status, ...) VALUES (?1, ?2, ?3, ...)",
-            params![exec.id, exec.ts_id, exec.status.to_string()],
-        )?;
+fn deduplicate_by_id(&self, records: Vec<(String, String, i64)>) -> HashMap<String, (String, String, i64)> {
+    let mut latest: HashMap<String, (String, String, i64)> = HashMap::new();
+
+    for (id, type_name, json, updated_at) in records {
+        match latest.get(&id) {
+            Some((_, _, existing_ts)) if *existing_ts > updated_at => continue,
+            _ => {
+                latest.insert(id, (type_name, json, updated_at));
+            }
+        }
     }
 
-    Ok(())
+    latest
 }
 ```
 
@@ -368,14 +711,14 @@ taskstore compact
 ```rust
 pub fn compact(&mut self, filename: &str) -> Result<()> {
     // 1. Read and deduplicate
-    let records = self.read_jsonl::<Execution>(filename)?;
-    let latest = deduplicate_by_id(records);
+    let records = self.read_jsonl_generic(filename)?;
+    let latest = self.deduplicate_by_id(records);
 
     // 2. Write to temp file
     let temp = format!("{}.tmp", filename);
     let mut file = File::create(&temp)?;
-    for record in latest.values() {
-        writeln!(file, "{}", serde_json::to_string(record)?)?;
+    for (_, (_, json, _)) in latest.values() {
+        writeln!(file, "{}", json)?;
     }
     file.sync_all()?;
 
@@ -393,19 +736,17 @@ pub fn compact(&mut self, filename: &str) -> Result<()> {
 Git integration is CRITICAL for TaskStore. This is Layer 2 of the architecture:
 
 ```
-Layer 1: Core task graph (CRUD, dependencies, status, SQLite + JSONL)
+Layer 1: Core storage (CRUD, filtering, SQLite + JSONL)
     ↓
 Layer 2: Git integration (merge driver, hooks, debouncing) ← THIS LAYER
     ↓
-Layer 3: Orchestration (comments, assignments, federation) ← TaskDaemon provides this
+Layer 3: Application logic (your business rules) ← YOUR APPLICATION provides this
 ```
 
 **Why Layer 2 is critical:**
-- Without custom merge driver: Concurrent PRD creation = merge conflicts requiring manual resolution
+- Without custom merge driver: Concurrent record creation = merge conflicts requiring manual resolution
 - Without git hooks: Database-JSONL inconsistencies, manual sync commands needed
 - Without debouncing: Poor performance (100 creates = 100 JSONL writes)
-
-**Lesson from Engram:** Engram mistakenly removed Layer 2 when trying to remove gastown coupling. These features are NOT orchestration - they're core git integration that makes git-backed storage actually work.
 
 ### 5.1. Custom Merge Driver (CRITICAL)
 
@@ -413,7 +754,7 @@ Layer 3: Orchestration (comments, assignments, federation) ← TaskDaemon provid
 
 **Why it's needed:**
 ```
-Scenario: Two developers create PRDs simultaneously
+Scenario: Two developers create records simultaneously
 
 Without merge driver:
   git merge → CONFLICT (line-based merge fails) → Manual resolution required
@@ -427,8 +768,9 @@ With merge driver:
 ```rust
 // src/merge.rs
 
-use crate::types::{Prd, TaskSpec, Execution};
+use crate::record::Record;
 use eyre::{Context, Result};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -448,33 +790,16 @@ pub fn merge_jsonl_files(
     ours_path: &Path,
     theirs_path: &Path,
 ) -> Result<String> {
-    // Auto-detect record type from filename
-    let filename = ours_path.file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-
-    if filename.contains("prds") {
-        merge_typed::<Prd>(ancestor_path, ours_path, theirs_path)
-    } else if filename.contains("task_specs") {
-        merge_typed::<TaskSpec>(ancestor_path, ours_path, theirs_path)
-    } else if filename.contains("executions") {
-        merge_typed::<Execution>(ancestor_path, ours_path, theirs_path)
-    } else if filename.contains("dependencies") {
-        merge_typed::<Dependency>(ancestor_path, ours_path, theirs_path)
-    } else {
-        Err(eyre::eyre!("Unknown JSONL file type: {}", filename))
-    }
+    // Generic merge using JSON values
+    merge_generic(ancestor_path, ours_path, theirs_path)
 }
 
-/// Generic merge for any record type with id and updated_at
-fn merge_typed<T>(ancestor: &Path, ours: &Path, theirs: &Path) -> Result<String>
-where
-    T: serde::Serialize + serde::de::DeserializeOwned + HasId + HasTimestamp + Clone,
-{
+/// Generic merge for any record type (uses JSON values)
+fn merge_generic(ancestor: &Path, ours: &Path, theirs: &Path) -> Result<String> {
     // 1. Parse all three files
-    let ancestor_records = parse_jsonl::<T>(ancestor)?;
-    let ours_records = parse_jsonl::<T>(ours)?;
-    let theirs_records = parse_jsonl::<T>(theirs)?;
+    let ancestor_records = parse_jsonl_generic(ancestor)?;
+    let ours_records = parse_jsonl_generic(ours)?;
+    let theirs_records = parse_jsonl_generic(theirs)?;
 
     // 2. Build ID maps (last occurrence wins - handles append-only JSONL)
     let ancestor_map = build_latest_map(ancestor_records);
@@ -494,7 +819,10 @@ where
             // Both branches modified the record
             (Some(ours_rec), Some(theirs_rec), Some(_ancestor_rec)) => {
                 // Pick the one with latest updated_at (last-write-wins)
-                if ours_rec.updated_at() >= theirs_rec.updated_at() {
+                let ours_ts = extract_timestamp(ours_rec);
+                let theirs_ts = extract_timestamp(theirs_rec);
+
+                if ours_ts >= theirs_ts {
                     merged.push(ours_rec.clone());
                 } else {
                     merged.push(theirs_rec.clone());
@@ -518,7 +846,9 @@ where
     }
 
     // 4. Sort by ID for deterministic output
-    merged.sort_by(|a, b| a.id().cmp(&b.id()));
+    merged.sort_by(|a, b| {
+        extract_id(a).cmp(&extract_id(b))
+    });
 
     // 5. Serialize to JSONL
     let jsonl = merged.iter()
@@ -529,11 +859,8 @@ where
     Ok(jsonl)
 }
 
-/// Parse JSONL file, handling multiple occurrences of same ID
-fn parse_jsonl<T>(path: &Path) -> Result<Vec<T>>
-where
-    T: serde::de::DeserializeOwned,
-{
+/// Parse JSONL file into generic JSON values
+fn parse_jsonl_generic(path: &Path) -> Result<Vec<Value>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -546,7 +873,7 @@ where
         if line.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str::<T>(line) {
+        match serde_json::from_str::<Value>(line) {
             Ok(record) => records.push(record),
             Err(e) => {
                 eprintln!("Warning: Failed to parse line {} in {}: {}", line_num + 1, path.display(), e);
@@ -558,15 +885,15 @@ where
 }
 
 /// Build map of ID → Record, keeping only the latest occurrence
-fn build_latest_map<T>(records: Vec<T>) -> HashMap<String, T>
-where
-    T: HasId + HasTimestamp,
-{
+fn build_latest_map(records: Vec<Value>) -> HashMap<String, Value> {
     let mut map = HashMap::new();
+
     for record in records {
-        let id = record.id();
+        let id = extract_id(&record);
+        let ts = extract_timestamp(&record);
+
         match map.get(&id) {
-            Some(existing) if existing.updated_at() > record.updated_at() => {
+            Some(existing) if extract_timestamp(existing) > ts => {
                 // Keep existing (it's newer)
                 continue;
             }
@@ -576,29 +903,22 @@ where
             }
         }
     }
+
     map
 }
 
-/// Trait for records with an ID field
-pub trait HasId {
-    fn id(&self) -> String;
+fn extract_id(value: &Value) -> String {
+    value.get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
-/// Trait for records with an updated_at timestamp
-pub trait HasTimestamp {
-    fn updated_at(&self) -> i64;
+fn extract_timestamp(value: &Value) -> i64 {
+    value.get("updated_at")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
 }
-
-// Implementations for TaskStore types
-impl HasId for Prd {
-    fn id(&self) -> String { self.id.clone() }
-}
-
-impl HasTimestamp for Prd {
-    fn updated_at(&self) -> i64 { self.updated_at }
-}
-
-// Similar implementations for TaskSpec, Execution, Dependency...
 ```
 
 **Binary for git merge driver:**
@@ -680,32 +1000,33 @@ mkdir merge-test && cd merge-test
 git init
 
 # Setup
-taskstore init
-taskstore install-merge-driver
+mkdir .taskstore
+# Initialize your application's store
+taskstore install-hooks
 
-# Create PRD on main
-taskstore create-prd "Feature A" > /dev/null
+# Create record on main
+echo '{"id":"rec-001","title":"Feature A","updated_at":1000}' >> .taskstore/records.jsonl
 git add .taskstore
-git commit -m "Add Feature A"
+git commit -m "Add record A"
 
-# Branch and create different PRD
+# Branch and create different record
 git checkout -b branch1
-taskstore create-prd "Feature B" > /dev/null
+echo '{"id":"rec-002","title":"Feature B","updated_at":1001}' >> .taskstore/records.jsonl
 git add .taskstore
-git commit -m "Add Feature B"
+git commit -m "Add record B"
 
-# Back to main, create another PRD
+# Back to main, create another record
 git checkout main
-taskstore create-prd "Feature C" > /dev/null
+echo '{"id":"rec-003","title":"Feature C","updated_at":1002}' >> .taskstore/records.jsonl
 git add .taskstore
-git commit -m "Add Feature C"
+git commit -m "Add record C"
 
 # Merge - should auto-resolve with no conflicts
 git merge branch1
 
-# Verify all three PRDs exist
-taskstore list-prds
-# Expected: Feature A, Feature B, Feature C (no conflicts!)
+# Verify all three records exist
+grep -c "^{" .taskstore/records.jsonl
+# Expected: 3 (no conflicts!)
 ```
 
 ### 5.2. Git Hooks (IMPORTANT)
@@ -805,20 +1126,20 @@ cat .gitattributes
 
 ### 5.3. Debounced Export/Sync (PERFORMANCE)
 
-**What it does:** Batches multiple mutations into a single JSONL write to improve performance and reduce commit spam.
+**What it does:** Batches multiple mutations into a single JSONL write to improve performance.
 
 **Why it's needed:**
 ```
 Without debouncing:
-  50 PRD creates in 5 seconds = 50 JSONL appends = 50 fsync calls = poor performance
+  50 record creates in 5 seconds = 50 JSONL appends = 50 fsync calls = poor performance
 
 With debouncing:
-  50 PRD creates in 5 seconds = Wait 5s → 1 JSONL export = 1 fsync call = good performance
+  50 record creates in 5 seconds = Wait 5s → 1 JSONL export = 1 fsync call = good performance
 ```
 
 **When to use:**
-- Batch operations (creating many PRDs/TSs at once)
-- Rapid mutations (agent creating tasks quickly)
+- Batch operations (creating many records at once)
+- Rapid mutations (importing data)
 - Not needed for single operations (overhead not worth it)
 
 **Implementation:**
@@ -826,7 +1147,7 @@ With debouncing:
 ```rust
 // src/sync.rs
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -854,11 +1175,9 @@ pub struct SyncManager {
 }
 
 #[derive(Debug, Clone)]
-enum DirtyRecord {
-    Prd(String),
-    TaskSpec(String),
-    Execution(String),
-    Flush,  // Force immediate flush
+struct DirtyRecord {
+    record_type: String,
+    record_id: String,
 }
 
 impl SyncManager {
@@ -871,14 +1190,9 @@ impl SyncManager {
         Self { dirty_tx }
     }
 
-    /// Mark a PRD as dirty (will be exported on next flush)
-    pub fn mark_prd_dirty(&self, id: String) {
-        let _ = self.dirty_tx.send(DirtyRecord::Prd(id));
-    }
-
-    /// Force immediate flush (bypass debounce)
-    pub fn flush_now(&self) {
-        let _ = self.dirty_tx.send(DirtyRecord::Flush);
+    /// Mark a record as dirty (will be exported on next flush)
+    pub fn mark_dirty(&self, record_type: String, record_id: String) {
+        let _ = self.dirty_tx.send(DirtyRecord { record_type, record_id });
     }
 }
 
@@ -888,37 +1202,23 @@ async fn sync_worker(
     mut dirty_rx: mpsc::UnboundedReceiver<DirtyRecord>,
     config: SyncConfig,
 ) {
-    let mut dirty_prds = HashSet::new();
-    let mut dirty_task_specs = HashSet::new();
-    let mut dirty_executions = HashSet::new();
-
+    let mut dirty_records: HashMap<String, HashSet<String>> = HashMap::new();
     let mut timer = tokio::time::interval(Duration::from_millis(config.debounce_ms));
 
     loop {
         tokio::select! {
             Some(record) = dirty_rx.recv() => {
-                match record {
-                    DirtyRecord::Prd(id) => {
-                        dirty_prds.insert(id);
-                        timer.reset();  // Reset debounce timer
-                    }
-                    DirtyRecord::Flush => {
-                        // Force immediate flush
-                        export_dirty(&store_path, &dirty_prds, &dirty_task_specs, &dirty_executions).await.ok();
-                        dirty_prds.clear();
-                        dirty_task_specs.clear();
-                        dirty_executions.clear();
-                    }
-                    // ... handle other record types
-                }
+                dirty_records
+                    .entry(record.record_type)
+                    .or_default()
+                    .insert(record.record_id);
+                timer.reset();  // Reset debounce timer
             }
             _ = timer.tick() => {
                 // Timer fired - export if dirty
-                if !dirty_prds.is_empty() {
-                    export_dirty(&store_path, &dirty_prds, &dirty_task_specs, &dirty_executions).await.ok();
-                    dirty_prds.clear();
-                    dirty_task_specs.clear();
-                    dirty_executions.clear();
+                if !dirty_records.is_empty() {
+                    export_dirty(&store_path, &dirty_records).await.ok();
+                    dirty_records.clear();
                 }
             }
         }
@@ -936,95 +1236,99 @@ let store = Store::open(path)?;
 let store = Store::with_sync_config(path, SyncConfig::default())?;
 ```
 
-## 6. Excluded Features (Layer 3 - Orchestration)
+## 6. Filtering and Querying
 
-### Overview
+### Filter Types
 
-The following features are **intentionally excluded** from TaskStore because they belong in Layer 3 (Orchestration), which TaskDaemon provides.
+```rust
+// src/filter.rs
 
-This section documents these features for future reference, in case we need to bring them back or understand why they were excluded.
+use serde::{Deserialize, Serialize};
 
-**Key principle:** TaskStore is a **library** (Layer 1 + Layer 2), not an **application** (Layer 1 + Layer 2 + Layer 3).
+/// Generic filter for querying records
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Filter {
+    pub field: String,
+    pub op: FilterOp,
+    pub value: FilterValue,
+}
 
-### 6.1. Comments (Inter-Loop Communication)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterOp {
+    Eq,
+    Ne,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    Contains,
+    StartsWith,
+    In,
+}
 
-**Why Beads has it:** Multi-agent teams need coordination, async communication channel
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FilterValue {
+    String(String),
+    Number(i64),
+    List(Vec<String>),
+}
 
-**Why TaskStore excludes it (CORRECT):** TaskDaemon provides inter-loop messaging via Coordinator (Notify/Query/Share)
+impl Filter {
+    /// Convert filter to SQL WHERE clause
+    pub fn to_sql(&self) -> (String, Vec<rusqlite::types::Value>) {
+        let clause = match self.op {
+            FilterOp::Eq => format!("index_name = ? AND index_value = ?"),
+            FilterOp::Ne => format!("index_name = ? AND index_value != ?"),
+            FilterOp::Contains => format!("index_name = ? AND index_value LIKE ?"),
+            FilterOp::In => {
+                let placeholders = vec!["?"; self.value.as_list().len()].join(",");
+                format!("index_name = ? AND index_value IN ({})", placeholders)
+            }
+            // ... other operators
+        };
 
-**Data model (for reference):**
-```sql
-CREATE TABLE comments (
-    id TEXT PRIMARY KEY,
-    item_id TEXT NOT NULL,
-    author TEXT NOT NULL,
-    content TEXT NOT NULL,
-    created_at INTEGER NOT NULL
-);
+        let params = self.params();
+        (clause, params)
+    }
+}
 ```
 
-### 6.2. Assignments (Work Distribution)
+### Example Usage
 
-**Why Beads has it:** Multi-user collaboration, clear ownership of work
+```rust
+use taskstore::{Store, Filter, FilterOp, FilterValue};
 
-**Why TaskStore excludes it (CORRECT):** TaskDaemon provides work distribution via Scheduler. Dynamic assignment is better than static.
+let store = Store::open(".taskstore")?;
 
-**Note:** `executions.assigned_to` exists for "who is currently working on it" (runtime), not pre-assignment (orchestration).
+// Get all active plans
+let filter = Filter {
+    field: "status".to_string(),
+    op: FilterOp::Eq,
+    value: FilterValue::String("active".to_string()),
+};
 
-### 6.3. Federation (Multi-Repo Coordination)
+let plans: Vec<Plan> = store.list(Some(filter))?;
 
-**Why Beads has it:** Large projects span multiple repos, cross-repo dependencies
+// Get tasks for a specific plan
+let filter = Filter {
+    field: "plan_id".to_string(),
+    op: FilterOp::Eq,
+    value: FilterValue::String("plan-001".to_string()),
+};
 
-**Why TaskStore excludes it (CORRECT):** TaskDaemon can manage multiple TaskStore instances. Federation is orchestration, not storage.
+let tasks: Vec<Task> = store.list(Some(filter))?;
 
-### 6.4. Semantic Compaction (LLM Context Management)
+// Get all pending or blocked tasks
+let filter = Filter {
+    field: "status".to_string(),
+    op: FilterOp::In,
+    value: FilterValue::List(vec!["pending".to_string(), "blocked".to_string()]),
+};
 
-**Why Beads has it:** Automatically summarize old/closed tasks to reduce token count for LLM context
-
-**Why TaskStore excludes it (CORRECT):** Context management is TaskDaemon's responsibility. TaskStore just stores data.
-
-### 6.5. Daemon Monitoring (Health Checks, Observability)
-
-**Why Beads has it:** Production reliability, event-driven daemon needs monitoring
-
-**Why TaskStore excludes it (CORRECT):** TaskDaemon IS the daemon. TaskStore is a library embedded in TaskDaemon. Monitoring is TaskDaemon's responsibility (via TUI).
-
-### 6.6. Time Tracking & Estimates
-
-**Why Beads has it:** Project planning, agent performance tracking
-
-**Why TaskStore excludes it (CORRECT):** Not core to execution model. TaskDaemon can add if needed.
-
-**Note:** We already have `started_at` and `completed_at` in executions (sufficient for duration calculation).
-
-### 6.7. Protected Branches & Git Workflows
-
-**Why Beads has it:** Production safety, protected main branch, work on sync-branch
-
-**Why TaskStore excludes it (CORRECT):** Git workflows are repository policy, not storage concern. Configure at GitHub/GitLab level.
-
-### 6.8. Event-Driven Daemon (File Watching)
-
-**Why Beads has it:** Multi-user real-time collaboration, sub-500ms sync latency
-
-**Why TaskStore excludes it (OPTIONAL - MAY SKIP):** TaskDaemon is single-process (state manager owns Store). No concurrent external access. Git hooks handle post-merge sync.
-
-**Decision:** Skip for now. Revisit if multi-process access needed.
-
-### Summary of Exclusions
-
-| Feature | Beads | Engram | TaskStore | Owner |
-|---------|-------|--------|-----------|-------|
-| Comments | ✅ | ❌ | ❌ | TaskDaemon Coordinator |
-| Assignments | ✅ | ❌ | ❌ | TaskDaemon Scheduler |
-| Federation | ✅ | ❌ | ❌ | TaskDaemon (multi-store) |
-| Semantic Compaction | ✅ | ❌ | ❌ | TaskDaemon (prompt building) |
-| Daemon Monitoring | ✅ | ❌ | ❌ | TaskDaemon TUI |
-| Time Tracking | ✅ | ❌ | ❌ | TaskDaemon (optional) |
-| Protected Branches | ✅ | ❌ | ❌ | Git/GitHub config |
-| Event-Driven Daemon | ✅ | ❌ | ❌ | Probably skip |
-
-**Key takeaway:** All Layer 3 features belong in TaskDaemon, not TaskStore. TaskStore focuses on Layer 1 (core) + Layer 2 (git integration).
+let tasks: Vec<Task> = store.list(Some(filter))?;
+```
 
 ## 7. Testing Strategy
 
@@ -1035,20 +1339,47 @@ CREATE TABLE comments (
 mod tests {
     use super::*;
 
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct TestRecord {
+        id: String,
+        value: String,
+        updated_at: i64,
+    }
+
+    impl Record for TestRecord {
+        fn record_type() -> RecordType {
+            RecordType::new("test")
+        }
+
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn updated_at(&self) -> i64 {
+            self.updated_at
+        }
+
+        fn set_updated_at(&mut self, timestamp: i64) {
+            self.updated_at = timestamp;
+        }
+    }
+
     #[test]
-    fn test_create_prd() {
+    fn test_create_and_get() {
         let mut store = Store::open_temp()?;
-        let prd = Prd {
-            id: "prd-001".to_string(),
-            title: "Test PRD".to_string(),
-            // ...
+
+        let record = TestRecord {
+            id: "test-001".to_string(),
+            value: "Hello".to_string(),
+            updated_at: 1000,
         };
 
-        let id = store.create_prd(prd)?;
-        assert_eq!(id, "prd-001");
+        let id = store.create(record)?;
+        assert_eq!(id, "test-001");
 
-        let retrieved = store.get_prd(&id)?.unwrap();
-        assert_eq!(retrieved.title, "Test PRD");
+        let retrieved: Option<TestRecord> = store.get(&id)?;
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().value, "Hello");
     }
 
     #[test]
@@ -1056,15 +1387,37 @@ mod tests {
         let mut store = Store::open_temp()?;
 
         // Create multiple versions of same record
-        store.append_jsonl("executions.jsonl", &exec_v1)?;
-        store.append_jsonl("executions.jsonl", &exec_v2)?;
-        store.append_jsonl("executions.jsonl", &exec_v3)?;
+        let v1 = TestRecord { id: "test-001".to_string(), value: "v1".to_string(), updated_at: 1000 };
+        let v2 = TestRecord { id: "test-001".to_string(), value: "v2".to_string(), updated_at: 2000 };
+        let v3 = TestRecord { id: "test-001".to_string(), value: "v3".to_string(), updated_at: 3000 };
+
+        store.append_jsonl("test.jsonl", &v1)?;
+        store.append_jsonl("test.jsonl", &v2)?;
+        store.append_jsonl("test.jsonl", &v3)?;
 
         // Sync should keep only latest
         store.sync()?;
 
-        let exec = store.get_execution("exec-001")?.unwrap();
-        assert_eq!(exec.iteration_count, 3);  // v3 is latest
+        let record: Option<TestRecord> = store.get("test-001")?;
+        assert_eq!(record.unwrap().value, "v3");  // v3 is latest
+    }
+
+    #[test]
+    fn test_list_with_filter() {
+        let mut store = Store::open_temp()?;
+
+        store.create(TestRecord { id: "test-001".to_string(), value: "active".to_string(), updated_at: 1000 })?;
+        store.create(TestRecord { id: "test-002".to_string(), value: "inactive".to_string(), updated_at: 1000 })?;
+        store.create(TestRecord { id: "test-003".to_string(), value: "active".to_string(), updated_at: 1000 })?;
+
+        let filter = Filter {
+            field: "value".to_string(),
+            op: FilterOp::Eq,
+            value: FilterValue::String("active".to_string()),
+        };
+
+        let results: Vec<TestRecord> = store.list(Some(filter))?;
+        assert_eq!(results.len(), 2);
     }
 }
 ```
@@ -1079,56 +1432,60 @@ fn test_merge_driver() {
     let ours = "ours.jsonl";
     let theirs = "theirs.jsonl";
 
+    fs::write(base, r#"{"id":"rec-001","value":"base","updated_at":1000}"#)?;
+    fs::write(ours, r#"{"id":"rec-001","value":"ours","updated_at":2000}"#)?;
+    fs::write(theirs, r#"{"id":"rec-001","value":"theirs","updated_at":1500}"#)?;
+
     // Simulate merge
     let result = merge_jsonl_files(base, ours, theirs)?;
 
-    // Verify correct resolution
-    assert!(result.contains("latest version"));
+    // Verify correct resolution (ours wins - latest timestamp)
+    assert!(result.contains("ours"));
 }
 
 #[test]
 fn test_git_hook_sync() {
     // Initialize repo with taskstore
     let repo = init_test_repo()?;
+    let mut store = Store::open(repo.path())?;
     store.install_git_integration()?;
 
     // Simulate post-merge
-    run_hook("post-merge")?;
+    run_hook(&repo, "post-merge")?;
 
     // Verify sync was called
     assert!(store.is_synced()?);
 }
 ```
 
-## 7. CLI Commands
+## 8. CLI Commands
 
 **Full command set:**
 
 ```bash
 # List operations
-taskstore list-prds [--status STATUS]
-taskstore list-task-specs [--prd-id ID]
-taskstore list-executions [--status STATUS] [--limit N]
+taskstore list <type>                # List all records of type
+taskstore list <type> --filter "status=active"  # Filter results
 
 # Show operations
-taskstore show <id>           # Auto-detects type
-taskstore describe <id>       # Show full markdown content
+taskstore show <id>                  # Show record by ID
+taskstore describe <id>              # Show full details (if applicable)
 
 # Maintenance
-taskstore sync                # Rebuild SQLite from JSONL
-taskstore compact             # Remove superseded JSONL records
-taskstore check               # Validate consistency
+taskstore sync                       # Rebuild SQLite from JSONL
+taskstore compact                    # Remove superseded JSONL records
+taskstore check                      # Validate consistency
 
 # Git integration
-taskstore install-hooks       # Install git hooks and merge driver
+taskstore install-hooks              # Install git hooks and merge driver
 taskstore merge <base> <ours> <theirs>  # Merge driver (internal)
 
 # Export
-taskstore backup <dest>       # Copy JSONL files
-taskstore export-json         # Export all data as JSON
+taskstore backup <dest>              # Copy JSONL files
+taskstore export-json                # Export all data as JSON
 ```
 
-## 8. Performance Considerations
+## 9. Performance Considerations
 
 ### Optimization Strategies
 
@@ -1151,48 +1508,258 @@ tx.commit()?;
 // Don't load entire file into memory
 let file = BufReader::new(File::open(path)?);
 for line in file.lines() {
-    let record: Record = serde_json::from_str(&line?)?;
+    let record: Value = serde_json::from_str(&line?)?;
     process(record)?;
 }
 ```
 
-4. **Lazy markdown loading:**
+4. **Lazy index building:**
 ```rust
-// Don't load .md files until requested
-pub fn get_prd_content(&self, prd_id: &str) -> Result<String> {
-    let prd = self.get_prd(prd_id)?.unwrap();
-    let path = self.base_path.join("prds").join(&prd.file);
-    fs::read_to_string(path)
+// Only build indexes for fields that are actually queried
+pub fn ensure_index(&mut self, record_type: &str, field: &str) -> Result<()> {
+    if !self.has_index(record_type, field)? {
+        self.rebuild_index(record_type, field)?;
+    }
+    Ok(())
 }
 ```
 
-## 9. Error Handling Patterns
+5. **Selective field extraction:**
+```rust
+// Don't deserialize full records if you only need ID
+pub fn list_ids(&self, record_type: &str) -> Result<Vec<String>> {
+    let mut stmt = self.db.prepare(
+        "SELECT id FROM records WHERE type = ?1"
+    )?;
+
+    let ids = stmt.query_map(params![record_type], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+
+    Ok(ids)
+}
+```
+
+## 10. Error Handling Patterns
 
 ```rust
 // Use eyre for context
-pub fn create_prd(&mut self, prd: Prd) -> Result<String> {
+pub fn create<T: Record>(&mut self, record: T) -> Result<String> {
     // Validate
-    if prd.title.is_empty() {
-        return Err(eyre!("PRD title cannot be empty"));
+    if record.id().is_empty() {
+        return Err(eyre!("Record ID cannot be empty"));
     }
 
     // Write JSONL first (source of truth)
-    self.append_jsonl("prds.jsonl", &prd)
-        .wrap_err("Failed to write PRD to JSONL")?;
+    self.append_jsonl(&T::record_type().jsonl_file, &record)
+        .wrap_err_with(|| format!("Failed to write {} to JSONL", record.id()))?;
 
     // Then SQLite
-    self.db.execute(
-        "INSERT INTO prds (id, title, ...) VALUES (?1, ?2, ...)",
-        params![prd.id, prd.title],
-    ).wrap_err("Failed to insert PRD into SQLite")?;
+    self.insert_record(&record)
+        .wrap_err_with(|| format!("Failed to insert {} into SQLite", record.id()))?;
 
-    Ok(prd.id)
+    Ok(record.id().to_string())
 }
 ```
 
-## 10. References
+## 11. Example Application
 
-- [Storage Architecture](./storage-architecture.md) - Bead Store pattern
-- [TaskStore Design](./taskstore-design.md) - Full API and schema
+Here's a complete example of building a simple project management system with TaskStore:
+
+```rust
+// my-app/src/main.rs
+
+use taskstore::{Store, Record, RecordType, Filter, FilterOp, FilterValue};
+use serde::{Deserialize, Serialize};
+use eyre::Result;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Plan {
+    id: String,
+    title: String,
+    description: String,
+    status: String,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl Record for Plan {
+    fn record_type() -> RecordType { RecordType::new("plans") }
+    fn id(&self) -> &str { &self.id }
+    fn updated_at(&self) -> i64 { self.updated_at }
+    fn set_updated_at(&mut self, ts: i64) { self.updated_at = ts; }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Task {
+    id: String,
+    plan_id: String,
+    title: String,
+    status: String,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl Record for Task {
+    fn record_type() -> RecordType { RecordType::new("tasks") }
+    fn id(&self) -> &str { &self.id }
+    fn updated_at(&self) -> i64 { self.updated_at }
+    fn set_updated_at(&mut self, ts: i64) { self.updated_at = ts; }
+}
+
+fn main() -> Result<()> {
+    let mut store = Store::open(".myapp")?;
+
+    // Create a plan
+    let plan = Plan {
+        id: "plan-001".to_string(),
+        title: "Launch MVP".to_string(),
+        description: "Build and launch minimum viable product".to_string(),
+        status: "active".to_string(),
+        created_at: 1704067200000,
+        updated_at: 1704067200000,
+    };
+
+    store.create(plan)?;
+
+    // Create tasks
+    let task1 = Task {
+        id: "task-001".to_string(),
+        plan_id: "plan-001".to_string(),
+        title: "Design UI mockups".to_string(),
+        status: "pending".to_string(),
+        created_at: 1704067200000,
+        updated_at: 1704067200000,
+    };
+
+    store.create(task1)?;
+
+    // Query tasks for a plan
+    let filter = Filter {
+        field: "plan_id".to_string(),
+        op: FilterOp::Eq,
+        value: FilterValue::String("plan-001".to_string()),
+    };
+
+    let tasks: Vec<Task> = store.list(Some(filter))?;
+
+    println!("Tasks for plan-001:");
+    for task in tasks {
+        println!("  - {} [{}]", task.title, task.status);
+    }
+
+    Ok(())
+}
+```
+
+## 12. Best Practices
+
+### 1. Define Clear Record Types
+
+Keep your record types focused and well-defined:
+
+```rust
+// Good: Focused, single responsibility
+struct User { id, name, email, ... }
+struct Event { id, user_id, type, ... }
+
+// Bad: Kitchen sink, too many concerns
+struct UserWithEventsAndSettings { ... }
+```
+
+### 2. Use Consistent Timestamps
+
+Always use milliseconds since epoch (i64):
+
+```rust
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+```
+
+### 3. Index Only What You Query
+
+Don't index every field - only the ones you actually filter on:
+
+```rust
+// Good: Index fields you query
+store.register_index::<Task>("plan_id")?;
+store.register_index::<Task>("status")?;
+
+// Bad: Indexing fields you never query
+store.register_index::<Task>("created_at")?;  // If you never filter by this
+```
+
+### 4. Use Meaningful IDs
+
+Generate IDs that are sortable and contain type information:
+
+```rust
+use uuid::Uuid;
+
+fn new_id(prefix: &str) -> String {
+    format!("{}-{}", prefix, Uuid::now_v7())
+}
+
+// Results in: plan-01932abc-def0-7890-1234-567890abcdef
+let id = new_id("plan");
+```
+
+### 5. Handle Errors Gracefully
+
+Provide context in error messages:
+
+```rust
+store.create(plan)
+    .wrap_err_with(|| format!("Failed to create plan: {}", plan.title))?;
+```
+
+## 13. Migration from Other Storage Systems
+
+### From SQL Database
+
+```rust
+// Read from old SQL database
+let plans = sqlx::query_as::<_, OldPlan>("SELECT * FROM plans")
+    .fetch_all(&pool)
+    .await?;
+
+// Convert and write to TaskStore
+let mut store = Store::open(".taskstore")?;
+for old_plan in plans {
+    let new_plan = Plan {
+        id: format!("plan-{}", old_plan.id),
+        title: old_plan.name,
+        // ... map fields
+        updated_at: now_ms(),
+    };
+
+    store.create(new_plan)?;
+}
+```
+
+### From JSON Files
+
+```rust
+// Read from old JSON files
+let data: Vec<OldRecord> = serde_json::from_str(&fs::read_to_string("data.json")?)?;
+
+// Convert and write to TaskStore
+let mut store = Store::open(".taskstore")?;
+for old_record in data {
+    let new_record = convert_record(old_record);
+    store.create(new_record)?;
+}
+```
+
+## 14. References
+
+- [Storage Architecture](./storage-architecture.md) - Architecture overview
+- [TaskStore Design](./taskstore-design.md) - Detailed design document
 - SQLite documentation: https://www.sqlite.org/
 - JSONL format: https://jsonlines.org/
+- Git merge driver: https://git-scm.com/docs/gitattributes#_defining_a_custom_merge_driver

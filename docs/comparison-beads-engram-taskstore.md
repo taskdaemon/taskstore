@@ -1,7 +1,7 @@
 # Comparative Analysis: TaskStore vs Beads vs Engram
 
 **Date:** 2026-01-13
-**Purpose:** Ensure TaskStore learns from both Beads and Engram to build the right thing
+**Purpose:** Understand how TaskStore compares to existing git-backed storage systems
 
 ## Executive Summary
 
@@ -12,8 +12,8 @@
 | System | Author | Language | LOC | Status | Philosophy |
 |--------|--------|----------|-----|--------|------------|
 | **Beads** | Steve Yegge | Go | ~10K+ | Production | Full-featured issue tracker with deep git integration |
-| **Engram** | Scott Aidler | Rust | ~4K | v0.1.2 | Minimal task graph (accidentally minimal from removing gastown) |
-| **TaskStore** | Planned | Rust | TBD | Design | Planned as foundation for TaskDaemon orchestrator |
+| **Engram** | Scott Aidler | Rust | ~4K | v0.1.2 | Minimal task graph (accidentally minimal from removing core features) |
+| **TaskStore** | Planned | Rust | TBD | Design | Generic infrastructure library for git-backed persistent storage |
 
 ### The Core Pattern (All Three Share)
 
@@ -36,9 +36,9 @@ From the "Accidental Minimalism" document, Engram's agent mistakenly removed fea
 | Feature | Engram Removed It? | Why Wrong | Impact | TaskStore Status |
 |---------|-------------------|-----------|--------|------------------|
 | **Custom merge driver** | ❌ YES | Seemed like orchestration, but it's pure function for field-level merging | Manual conflict resolution, line-based git fails | ⚠️ **NOT IN PLAN** |
-| **Git hooks** | ❌ YES | Seemed like gastown intercept, but it's workflow automation | Manual `sync` before every commit, inconsistencies | ⚠️ **MENTIONED BUT UNCLEAR** |
+| **Git hooks** | ❌ YES | Seemed like external integration, but it's workflow automation | Manual `sync` before every commit, inconsistencies | ⚠️ **MENTIONED BUT UNCLEAR** |
 | **Incremental export** | ❌ YES | FlushManager looked complex, but it's performance optimization | 100 creates = 100 JSONL appends, commit spam | ⚠️ **NOT IN PLAN** |
-| **Comments** | ❌ YES | Inter-agent communication, but also useful for humans | No way to annotate tasks | ✅ **Correctly excluded** |
+| **Comments** | ❌ YES | Inter-agent communication, also useful for humans | No way to annotate records | ✅ **Correctly excluded** |
 | **Assignments** | ❌ YES | Work distribution (orchestrator's job) | No ownership tracking | ✅ **Correctly excluded** |
 
 ### What This Means for TaskStore
@@ -48,7 +48,7 @@ From the "Accidental Minimalism" document, Engram's agent mistakenly removed fea
 - ⚠️ No mention of custom merge driver in implementation guide
 - ⚠️ Git hooks mentioned but not detailed
 - ❌ No incremental export/debouncing mentioned
-- ✅ Correctly excludes comments/assignments (TaskDaemon handles these)
+- ✅ Correctly excludes comments/assignments (application layer handles these)
 
 **We need to add the git integration features that Engram wrongly removed.**
 
@@ -56,17 +56,17 @@ From the "Accidental Minimalism" document, Engram's agent mistakenly removed fea
 
 ## The Three Layers of Features
 
-### Layer 1: Core Task Graph (All Three Have This)
+### Layer 1: Core Storage (All Three Have This)
 
 **What it is:** Pure data structure operations
 
 | Feature | Beads | Engram | TaskStore (Planned) |
 |---------|-------|--------|---------------------|
-| Item CRUD | ✅ | ✅ | ✅ |
+| Record CRUD | ✅ | ✅ | ✅ |
 | Dependency graph (blocks, parent-child, related) | ✅ | ✅ | ✅ |
 | Status transitions and validation | ✅ | ✅ | ✅ |
 | SQLite + JSONL persistence | ✅ | ✅ | ✅ |
-| Query filters and `ready()` | ✅ | ✅ | ✅ |
+| Query filters and indexes | ✅ | ✅ | ✅ |
 | Cycle detection | ✅ | ✅ | ✅ |
 | Hash-based IDs | ✅ | ✅ | ✅ |
 
@@ -85,16 +85,16 @@ From the "Accidental Minimalism" document, Engram's agent mistakenly removed fea
 
 **Verdict:** TaskStore currently missing critical Layer 2 features. ❌
 
-### Layer 3: Orchestration (TaskDaemon's Job, Not TaskStore's)
+### Layer 3: Application Logic (Application's Job, Not Library's)
 
-**What it is:** Multi-agent coordination
+**What it is:** Domain-specific coordination
 
 | Feature | Beads | Engram | TaskStore (Planned) | **Correct Answer** |
 |---------|-------|--------|---------------------|--------------------|
-| Comments (inter-agent messaging) | ✅ | ❌ | ❌ | **❌ Exclude (TaskDaemon)** |
-| Assignments (work distribution) | ✅ | ❌ | ❌ | **❌ Exclude (TaskDaemon)** |
-| Federation (multi-repo) | ✅ | ❌ | ❌ | **❌ Exclude (TaskDaemon)** |
-| Semantic compaction (LLM context) | ✅ | ❌ | ❌ | **❌ Exclude (TaskDaemon)** |
+| Comments (inter-agent messaging) | ✅ | ❌ | ❌ | **❌ Exclude (Application)** |
+| Assignments (work distribution) | ✅ | ❌ | ❌ | **❌ Exclude (Application)** |
+| Federation (multi-repo) | ✅ | ❌ | ❌ | **❌ Exclude (Application)** |
+| Semantic compaction (LLM context) | ✅ | ❌ | ❌ | **❌ Exclude (Application)** |
 
 **Verdict:** TaskStore correctly excludes Layer 3. ✅
 
@@ -130,20 +130,17 @@ From the "Accidental Minimalism" document, Engram's agent mistakenly removed fea
 
 #### What TaskStore Plans
 
-**From `taskstore-design.md`:**
+**From design docs:**
 > "Custom git merge driver handles JSONL conflicts automatically"
 
-**From `storage-architecture.md`:**
-> "Git merge driver: Three-way merge for JSONL files (by ID, latest wins)"
-
-**From `implementation-guide.md`:**
+**From implementation guide:**
 > ⚠️ **NOT COVERED**
 
 **The Problem:** Design mentions it, but **no implementation detail, no algorithms, no examples**.
 
 #### What We Must Do
 
-**Add to `implementation-guide.md`:**
+**Add to implementation guide:**
 
 ```rust
 // taskstore/src/merge.rs
@@ -154,9 +151,9 @@ pub fn merge_jsonl_files(
     theirs_path: &Path,
 ) -> Result<String> {
     // 1. Parse all three files
-    let ancestor_records: Vec<Prd> = parse_jsonl(ancestor_path)?;
-    let ours_records: Vec<Prd> = parse_jsonl(ours_path)?;
-    let theirs_records: Vec<Prd> = parse_jsonl(theirs_path)?;
+    let ancestor_records: Vec<Record> = parse_jsonl(ancestor_path)?;
+    let ours_records: Vec<Record> = parse_jsonl(ours_path)?;
+    let theirs_records: Vec<Record> = parse_jsonl(theirs_path)?;
 
     // 2. Build ID maps (last occurrence wins)
     let ancestor_map = build_latest_map(ancestor_records);
@@ -235,8 +232,8 @@ impl Store {
 ```
 
 **Why this matters:**
-- Without merge driver: Concurrent PRD creation = merge conflicts
-- With merge driver: Concurrent PRD creation = automatic merge
+- Without merge driver: Concurrent record creation = merge conflicts
+- With merge driver: Concurrent record creation = automatic merge
 - **This is the whole point of "git-backed" vs "git-annoying"**
 
 ---
@@ -271,14 +268,14 @@ bd import  # Rebuild after branch switch
 
 #### What TaskStore Plans
 
-**From `implementation-guide.md`:**
+**From implementation guide:**
 > "Git hooks: post-merge and post-rebase call taskstore sync"
 
 **The Problem:** Only mentions 2 hooks, missing pre-commit and pre-push. No implementation detail.
 
 #### What We Must Do
 
-**Add complete hook set to `implementation-guide.md`:**
+**Add complete hook set to implementation guide:**
 
 ```rust
 impl Store {
@@ -376,16 +373,16 @@ func (fm *FlushManager) Run() {
 #### What Engram Does
 
 ```rust
-pub fn append_item(&mut self, item: &Item) -> Result<()> {
+pub fn append_record(&mut self, record: &Record) -> Result<()> {
     // Write to JSONL immediately
     let mut file = OpenOptions::new()
         .append(true)
-        .open(&items_path)?;
-    writeln!(file, "{}", serde_json::to_string(item)?)?;
+        .open(&records_path)?;
+    writeln!(file, "{}", serde_json::to_string(record)?)?;
     file.sync_all()?;  // fsync every time
 
     // Update SQLite immediately
-    self.insert_item_to_db(item)?;
+    self.insert_record_to_db(record)?;
 
     Ok(())
 }
@@ -405,7 +402,7 @@ Current design matches Engram's immediate-write approach.
 
 #### What We Should Do
 
-**Add to `implementation-guide.md`:**
+**Add to implementation guide:**
 
 ```rust
 // Simple debouncing (much simpler than Beads FlushManager)
@@ -443,7 +440,7 @@ impl Store {
                     }
                     _ = timer.tick() => {
                         if !dirty.is_empty() {
-                            // Export dirty items to JSONL
+                            // Export dirty records to JSONL
                             export_dirty(&store_path, &dirty).await?;
                             dirty.clear();
                         }
@@ -456,9 +453,9 @@ impl Store {
 ```
 
 **Why this matters:**
-- TaskDaemon will create many PRDs/TSs in rapid succession
-- Without debouncing: 50 PRDs = 50 JSONL writes = commit spam
-- With debouncing: 50 PRDs in 5s = 1 JSONL write = clean history
+- Applications will create many records in rapid succession
+- Without debouncing: 50 records = 50 JSONL writes = commit spam
+- With debouncing: 50 records in 5s = 1 JSONL write = clean history
 
 ---
 
@@ -470,7 +467,7 @@ impl Store {
 |--------|-----------|-----------|----------------|
 | **Beads** | Single file (`issues.jsonl`) | All entities together, custom merge driver handles it | Field-level 3-way merge via `beads-merge` |
 | **Engram** | Split files (`items.jsonl`, `edges.jsonl`) | Separate concerns, simpler to parse | Line-based git merge (conflicts likely) |
-| **TaskStore** | Split files (`prds.jsonl`, `task_specs.jsonl`, `executions.jsonl`) | One file per entity type | **UNSPECIFIED** ⚠️ |
+| **TaskStore** | Generic `records.jsonl` tables | One file per record type | **UNSPECIFIED** ⚠️ |
 
 **The Question:** Should TaskStore use single-file (like Beads) or split-files (like Engram)?
 
@@ -492,13 +489,13 @@ impl Store {
 
 ```bash
 # .gitattributes
-.taskstore/prds.jsonl merge=taskstore-merge
-.taskstore/task_specs.jsonl merge=taskstore-merge
-.taskstore/executions.jsonl merge=taskstore-merge
-.taskstore/dependencies.jsonl merge=taskstore-merge
+.taskstore/plans.jsonl merge=taskstore-merge
+.taskstore/tasks.jsonl merge=taskstore-merge
+.taskstore/users.jsonl merge=taskstore-merge
+.taskstore/events.jsonl merge=taskstore-merge
 ```
 
-**Why:** Split files match TaskStore's entity model better (PRDs ≠ TSs ≠ Executions). We can still have intelligent merging.
+**Why:** Split files match TaskStore's generic entity model better (different record types). We can still have intelligent merging.
 
 ---
 
@@ -508,7 +505,7 @@ impl Store {
 |--------|--------|--------|-------------------|
 | **Beads** | `bd-a1b2` | Progressive (4-6 chars) | Detect collision, grow length |
 | **Engram** | `eg-0a1b2c3d4e` | Fixed 10 hex chars | Virtually impossible |
-| **TaskStore** | `prd-550e8400` (UUIDv7) | 8 hex chars | Virtually impossible |
+| **TaskStore** | UUIDv7 | 8 hex chars | Virtually impossible |
 
 **Verdict:** TaskStore's UUIDv7 approach is good. ✅
 
@@ -526,12 +523,12 @@ Short IDs (like Beads) are nice for humans but add complexity. TaskStore's appro
 
 **What we should do:**
 - Daemon is optional for TaskStore (not mentioned in design)
-- TaskDaemon owns the Store directly (not via daemon)
-- **Decision:** Skip daemon complexity for TaskStore. TaskDaemon's state manager owns the Store directly.
+- Applications own the Store directly (not via daemon)
+- **Decision:** Skip daemon complexity for TaskStore. Applications embed the Store directly.
 
 **Rationale:**
 - Beads needs daemon because it's a CLI tool (multiple `bd` commands in parallel)
-- TaskStore is a library embedded in TaskDaemon (single process owns Store)
+- TaskStore is a library embedded in applications (single process owns Store)
 - No concurrent CLI access = no need for daemon
 
 **Verdict:** Correctly excluded. ✅
@@ -550,7 +547,7 @@ Short IDs (like Beads) are nice for humans but add complexity. TaskStore's appro
 3. Show installation process
 4. Include in Phase 1 implementation
 
-**Risk if not addressed:** Concurrent PRD/TS creation = merge conflicts = manual resolution = defeats purpose of git-backed storage.
+**Risk if not addressed:** Concurrent record creation = merge conflicts = manual resolution = defeats purpose of git-backed storage.
 
 ### Gap 2: Git Hooks (IMPORTANT)
 
@@ -574,22 +571,7 @@ Short IDs (like Beads) are nice for humans but add complexity. TaskStore's appro
 3. Make it optional (not required for correctness)
 4. Include in Phase 2 implementation
 
-**Risk if not addressed:** 50 PRD creates = 50 JSONL writes = poor performance, commit spam.
-
-### Gap 4: Markdown File Storage Integration
-
-**Status:** Mentioned, **not detailed**
-
-**Questions to answer:**
-1. When are `.md` files written? (On create? On demand? Both?)
-2. What happens if JSONL exists but `.md` is missing?
-3. How do we keep JSONL metadata and `.md` content in sync?
-4. Do we need a merge driver for `.md` files too?
-
-**Action Required:**
-1. Clarify markdown file lifecycle in implementation guide
-2. Add error handling for missing files
-3. Document sync process between JSONL and `.md`
+**Risk if not addressed:** 50 record creates = 50 JSONL writes = poor performance, commit spam.
 
 ---
 
@@ -601,7 +583,7 @@ Short IDs (like Beads) are nice for humans but add complexity. TaskStore's appro
 
 1. **Custom merge driver** (`src/merge.rs`)
    - Three-way merge algorithm for JSONL
-   - Support all entity types (PRDs, TS, Executions, Dependencies)
+   - Support all record types
    - Install command: `taskstore install-merge-driver`
 
 2. **Complete git hooks**
@@ -611,11 +593,6 @@ Short IDs (like Beads) are nice for humans but add complexity. TaskStore's appro
    - pre-push: Ensure everything exported
    - post-checkout: Rebuild SQLite after branch switch
    - Install command: `taskstore install-hooks`
-
-3. **Markdown file lifecycle**
-   - Clarify when `.md` files are written
-   - Error handling for missing files
-   - Sync mechanism between JSONL and `.md`
 
 ### Phase 2: Performance Optimization (Should Have)
 
@@ -637,9 +614,9 @@ Short IDs (like Beads) are nice for humans but add complexity. TaskStore's appro
 **Add if time permits:**
 
 1. **Blocked cache** (like Beads)
-   - Materialized view for `ready()` query
+   - Materialized view for efficient queries
    - 25x speedup for large datasets
-   - Only needed if >1K items
+   - Only needed if >1K records
 
 2. **Event-driven sync** (like Beads)
    - File watching (inotify/FSEvents)
@@ -648,13 +625,13 @@ Short IDs (like Beads) are nice for humans but add complexity. TaskStore's appro
 
 ### What NOT to Add (Correctly Excluded)
 
-These belong in TaskDaemon, not TaskStore:
+These belong in applications, not the library:
 
-- ❌ Comments (inter-loop communication)
-- ❌ Assignments (work distribution)
-- ❌ Federation (multi-repo coordination)
-- ❌ Semantic compaction (LLM context management)
-- ❌ Daemon with monitoring (TaskDaemon is the daemon)
+- ❌ Comments (application-specific communication)
+- ❌ Assignments (application-specific work distribution)
+- ❌ Federation (application-specific coordination)
+- ❌ Semantic compaction (application-specific context management)
+- ❌ Daemon with monitoring (application is the daemon)
 
 ---
 
@@ -662,13 +639,13 @@ These belong in TaskDaemon, not TaskStore:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                   LAYER 3: Orchestration                     │
-│                      (TaskDaemon)                            │
-│  - Multi-loop coordination                                   │
-│  - PRD/TS lifecycle management                               │
-│  - Inter-loop messaging (Notify/Query/Share)                 │
-│  - Proactive rebase                                          │
-│  - TUI (monitoring and control)                              │
+│                   LAYER 3: Application Logic                 │
+│                    (Your Application)                        │
+│  - Domain-specific coordination                              │
+│  - Record lifecycle management                               │
+│  - Inter-component messaging                                 │
+│  - Business logic                                            │
+│  - User interface                                            │
 └──────────────────────────┬──────────────────────────────────┘
                            │
                            v
@@ -678,19 +655,18 @@ These belong in TaskDaemon, not TaskStore:
 │  ✅ Custom merge driver (field-level merging)                │
 │  ✅ Git hooks (pre-commit, post-merge, etc.)                 │
 │  ✅ Incremental export with debouncing                       │
-│  ✅ Markdown file integration                                │
 │  ⚠️ Event-driven daemon (optional, probably skip)            │
 └──────────────────────────┬──────────────────────────────────┘
                            │
                            v
 ┌─────────────────────────────────────────────────────────────┐
-│                  LAYER 1: Task Graph Core                    │
+│                  LAYER 1: Storage Core                       │
 │                   (TaskStore Library)                        │
-│  ✅ PRD/TS/Execution CRUD                                    │
+│  ✅ Generic Record CRUD with trait support                   │
 │  ✅ Dependency graph (blocks, parent-child, related)         │
 │  ✅ Status transitions and validation                        │
 │  ✅ SQLite + JSONL persistence                               │
-│  ✅ Query filters and ready() calculation                    │
+│  ✅ Query filters and indexes                                │
 │  ✅ Cycle detection                                          │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -699,24 +675,219 @@ These belong in TaskDaemon, not TaskStore:
 
 ---
 
+## Generic Usage Examples
+
+### Example 1: Project Management
+
+```rust
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Plan {
+    id: String,
+    title: String,
+    description: String,
+    status: String,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+impl Record for Plan {
+    fn id(&self) -> &str { &self.id }
+    fn updated_at(&self) -> DateTime<Utc> { self.updated_at }
+}
+
+// Create store
+let store = Store::open("/path/to/repo/.taskstore")?;
+
+// Create records
+let plan = Plan {
+    id: generate_id(),
+    title: "Q1 Launch".to_string(),
+    description: "Ship v1.0".to_string(),
+    status: "active".to_string(),
+    created_at: Utc::now(),
+    updated_at: Utc::now(),
+};
+
+store.create(&plan)?;
+
+// Query records
+let active_plans = store.list::<Plan>(Filter::new().status("active"))?;
+
+// Update records
+plan.status = "completed".to_string();
+store.update(&plan)?;
+```
+
+### Example 2: Event Tracking
+
+```rust
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Event {
+    id: String,
+    event_type: String,
+    timestamp: DateTime<Utc>,
+    metadata: HashMap<String, String>,
+}
+
+impl Record for Event {
+    fn id(&self) -> &str { &self.id }
+    fn updated_at(&self) -> DateTime<Utc> { self.timestamp }
+}
+
+// Store events
+let event = Event {
+    id: generate_id(),
+    event_type: "user_login".to_string(),
+    timestamp: Utc::now(),
+    metadata: hashmap! {
+        "user_id".to_string() => "user-123".to_string(),
+        "ip_address".to_string() => "192.168.1.1".to_string(),
+    },
+};
+
+store.create(&event)?;
+
+// Query events
+let recent_logins = store.list::<Event>(
+    Filter::new()
+        .event_type("user_login")
+        .since(Utc::now() - Duration::hours(24))
+)?;
+```
+
+### Example 3: Task Dependencies
+
+```rust
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Task {
+    id: String,
+    title: String,
+    status: String,
+    updated_at: DateTime<Utc>,
+}
+
+impl Record for Task {
+    fn id(&self) -> &str { &self.id }
+    fn updated_at(&self) -> DateTime<Utc> { self.updated_at }
+}
+
+// Create tasks with dependencies
+let task1 = Task { id: "task-001".to_string(), ... };
+let task2 = Task { id: "task-002".to_string(), ... };
+
+store.create(&task1)?;
+store.create(&task2)?;
+
+// Add dependency (task2 blocks task1)
+store.add_dependency(&task1.id, &task2.id, DependencyType::Blocks)?;
+
+// Get ready tasks (no blockers)
+let ready_tasks = store.ready::<Task>()?;
+```
+
+---
+
+## Schema Comparison
+
+### Generic TaskStore Schema
+
+```sql
+-- Generic records table (one per record type)
+CREATE TABLE records (
+    id TEXT PRIMARY KEY,
+    data TEXT NOT NULL,  -- Full JSON
+    status TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- Generic indexes table
+CREATE TABLE record_indexes (
+    record_id TEXT NOT NULL,
+    index_type TEXT NOT NULL,
+    index_value TEXT NOT NULL,
+    FOREIGN KEY (record_id) REFERENCES records(id)
+);
+
+-- Generic dependencies table
+CREATE TABLE dependencies (
+    id TEXT PRIMARY KEY,
+    from_id TEXT NOT NULL,
+    to_id TEXT NOT NULL,
+    dependency_type TEXT NOT NULL,  -- blocks, parent_child, related
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (from_id) REFERENCES records(id),
+    FOREIGN KEY (to_id) REFERENCES records(id)
+);
+```
+
+### Beads Schema (for comparison)
+
+```sql
+CREATE TABLE issues (
+    id TEXT PRIMARY KEY,
+    data TEXT NOT NULL,  -- Full JSON
+    title TEXT,
+    status TEXT,
+    assignee TEXT,
+    created_at TEXT,
+    updated_at TEXT
+);
+
+CREATE TABLE comments (
+    id TEXT PRIMARY KEY,
+    issue_id TEXT NOT NULL,
+    author TEXT,
+    body TEXT,
+    created_at TEXT,
+    FOREIGN KEY (issue_id) REFERENCES issues(id)
+);
+```
+
+### Engram Schema (for comparison)
+
+```sql
+CREATE TABLE items (
+    id TEXT PRIMARY KEY,
+    data TEXT NOT NULL,
+    title TEXT,
+    status TEXT,
+    created_at TEXT,
+    updated_at TEXT
+);
+
+CREATE TABLE edges (
+    id TEXT PRIMARY KEY,
+    from_id TEXT NOT NULL,
+    to_id TEXT NOT NULL,
+    edge_type TEXT,
+    created_at TEXT,
+    FOREIGN KEY (from_id) REFERENCES items(id),
+    FOREIGN KEY (to_id) REFERENCES items(id)
+);
+```
+
+**Key difference:** TaskStore uses generic `records` table with `record_indexes` for custom fields, while Beads and Engram have domain-specific schemas.
+
+---
+
 ## Comparison Summary Table
 
 | Feature | Beads | Engram | TaskStore (Planned) | **Should Be** |
 |---------|-------|--------|---------------------|---------------|
 | **Layer 1: Core** |
-| Item CRUD | ✅ | ✅ | ✅ | ✅ |
+| Record CRUD | ✅ | ✅ | ✅ | ✅ |
 | Dependency graph | ✅ | ✅ | ✅ | ✅ |
 | Status transitions | ✅ | ✅ | ✅ | ✅ |
 | SQLite + JSONL | ✅ | ✅ | ✅ | ✅ |
-| Query/ready/blocked | ✅ | ✅ | ✅ | ✅ |
+| Query/indexes | ✅ | ✅ | ✅ | ✅ |
 | Hash-based IDs | ✅ | ✅ | ✅ | ✅ |
 | **Layer 2: Git Integration** |
 | Custom merge driver | ✅ | ❌ | ⚠️ Mentioned | **✅ ADD** |
 | Git hooks (all 5) | ✅ | ❌ | ⚠️ Partial | **✅ ADD** |
 | Incremental export | ✅ | ❌ | ❌ Missing | **✅ ADD** |
-| Markdown integration | ✅ Via TOML | ❌ No | ⚠️ Vague | **✅ CLARIFY** |
 | Event-driven daemon | ✅ | ❌ | ❌ Missing | **❌ SKIP** |
-| **Layer 3: Orchestration** |
+| **Layer 3: Application Logic** |
 | Comments | ✅ | ❌ | ❌ | **❌ Exclude** |
 | Assignments | ✅ | ❌ | ❌ | **❌ Exclude** |
 | Federation | ✅ | ❌ | ❌ | **❌ Exclude** |
@@ -729,49 +900,91 @@ These belong in TaskDaemon, not TaskStore:
 
 ---
 
-## Action Items for TaskStore
+## Positioning: When to Use TaskStore
 
-### Immediate (Before Implementation Starts)
+### Good Use Cases
 
-1. **Update `implementation-guide.md`:**
-   - Add complete merge driver section with code
-   - Expand git hooks section (all 5 hooks)
-   - Add debounced export section
-   - Clarify markdown file lifecycle
+TaskStore is ideal for applications that need:
 
-2. **Update `taskstore-design.md`:**
-   - Add Layer 2 (Git Integration) as explicit section
-   - Show clear separation between Layer 1, Layer 2, Layer 3
-   - Update implementation phases to include git integration
+1. **Git-backed persistence**
+   - Version control for data
+   - Distributed collaboration
+   - Offline-first workflows
+   - Branch/merge for different scenarios
 
-3. **Update `storage-architecture.md`:**
-   - Emphasize merge driver is REQUIRED, not optional
-   - Show concrete examples of merge conflicts and resolution
-   - Document debouncing strategy
+2. **Structured data with relationships**
+   - Entities with dependencies
+   - Graph-like data structures
+   - Status-based workflows
 
-### During Phase 1 Implementation
+3. **Fast local queries + durable storage**
+   - SQLite for queries (indexed, fast)
+   - JSONL for durability (git-tracked)
+   - Best of both worlds
 
-4. **Implement merge driver first:**
-   - Critical path item
-   - Test with concurrent modifications
-   - Verify automatic conflict resolution
+4. **Generic record storage**
+   - Any domain (tasks, events, plans, users, etc.)
+   - Flexible schema via trait implementation
+   - Type-safe operations
 
-5. **Implement git hooks:**
-   - Install as part of `Store::init()`
-   - Make it work automatically
-   - Test pre-commit and post-merge flows
+### When NOT to Use TaskStore
 
-6. **Test markdown file integration:**
-   - Create PRD with `.md` file
-   - Verify JSONL and `.md` stay in sync
-   - Handle missing file cases
+Avoid TaskStore if:
 
-### During Phase 2 Implementation
+1. **You don't need git integration**
+   - Just use SQLite directly
+   - Or PostgreSQL for multi-user
+   - TaskStore adds complexity if you don't need versioning
 
-7. **Add debounced export:**
-   - Make it optional (default off for simplicity)
-   - Test with rapid mutations
-   - Verify batching works
+2. **You need real-time collaboration**
+   - TaskStore is git-based (async sync)
+   - Use operational transforms or CRDTs instead
+   - Or traditional database with live connections
+
+3. **You have extremely high write volume**
+   - JSONL is append-only (good for moderate writes)
+   - But not optimized for millions of writes/sec
+   - Use time-series database instead
+
+4. **You need complex queries across millions of records**
+   - SQLite is great for <100K records
+   - But not optimized for massive datasets
+   - Use PostgreSQL or specialized database
+
+---
+
+## Alternative Approaches
+
+### vs Traditional Database
+
+| Feature | TaskStore | PostgreSQL | SQLite |
+|---------|-----------|------------|--------|
+| Version control | ✅ Built-in | ❌ Need external tools | ❌ Need external tools |
+| Distributed | ✅ Git-based | ❌ Centralized | ❌ Local file |
+| Query performance | ✅ Fast (SQLite cache) | ✅ Excellent | ✅ Good |
+| Write performance | ⚠️ Moderate (JSONL) | ✅ Excellent | ✅ Excellent |
+| Offline support | ✅ Full | ❌ Limited | ✅ Full |
+| Schema flexibility | ✅ Generic trait | ❌ Fixed schema | ❌ Fixed schema |
+
+### vs File-based Storage
+
+| Feature | TaskStore | JSON files | YAML files |
+|---------|-----------|-----------|------------|
+| Query performance | ✅ Fast (indexed) | ❌ Parse every time | ❌ Parse every time |
+| Write performance | ✅ Append-only | ⚠️ Rewrite file | ⚠️ Rewrite file |
+| Relationships | ✅ Built-in graph | ❌ Manual | ❌ Manual |
+| Merge conflicts | ✅ Auto-resolved | ❌ Manual | ❌ Manual |
+| Human-readable | ✅ JSONL + SQLite | ✅ JSON | ✅ YAML |
+
+### vs Document Database
+
+| Feature | TaskStore | MongoDB | CouchDB |
+|---------|-----------|---------|---------|
+| Version control | ✅ Git-based | ❌ Manual | ⚠️ Built-in (different model) |
+| Distributed | ✅ Git-based | ✅ Replica sets | ✅ Multi-master |
+| Query performance | ✅ Good | ✅ Excellent | ⚠️ View-based |
+| Offline support | ✅ Full | ❌ Limited | ✅ Good |
+| Setup complexity | ✅ Low (no server) | ❌ High (server + config) | ❌ High (server + config) |
 
 ---
 
@@ -782,24 +995,23 @@ These belong in TaskDaemon, not TaskStore:
 The "Accidental Minimalism" analysis reveals that Engram's agent incorrectly classified git integration (merge driver, hooks, debouncing) as "orchestration" when they're actually **foundational to git-backed storage**.
 
 **Current state:**
-- ✅ Layer 1 (Core): Complete
+- ✅ Layer 1 (Storage Core): Complete
 - ❌ Layer 2 (Git Integration): Missing
-- ✅ Layer 3 (Orchestration): Correctly excluded
+- ✅ Layer 3 (Application Logic): Correctly excluded
 
 **What we must do:**
 1. Add custom merge driver (CRITICAL)
 2. Add complete git hooks (IMPORTANT)
 3. Add debounced export (PERFORMANCE)
-4. Clarify markdown file lifecycle (CLARITY)
 
 **What we must NOT do:**
-- Don't add comments/assignments/federation (TaskDaemon's job)
-- Don't add daemon monitoring (TaskDaemon is the daemon)
-- Don't add semantic compaction (TaskDaemon's job)
+- Don't add comments/assignments/federation (application's job)
+- Don't add daemon monitoring (application is the daemon)
+- Don't add domain-specific logic (keep it generic)
 
 **If we don't fix this:** TaskStore will repeat Engram's mistakes, and we'll have a git-backed storage system that's annoying to use (manual conflict resolution, manual sync, poor performance).
 
-**If we do fix this:** TaskStore will be like Beads' core (solid git integration) without the orchestration baggage (which TaskDaemon provides).
+**If we do fix this:** TaskStore will be a solid, generic git-backed storage library that any application can use for persistent, versioned, distributed data storage.
 
 ---
 

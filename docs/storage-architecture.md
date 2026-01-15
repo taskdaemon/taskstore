@@ -1,4 +1,4 @@
-# TaskDaemon Storage Architecture: The Bead Store Pattern
+# TaskStore Storage Architecture: The Bead Store Pattern
 
 **Date:** 2026-01-13
 **Author:** Claude Sonnet 4.5
@@ -6,7 +6,9 @@
 
 ## Summary
 
-TaskDaemon uses the **Bead Store pattern** from Steve Yegge's Gas Town: work items stored as one-line JSON in Git-backed JSONL files, with SQLite as a rebuildable query cache. This provides durability, version control, collaboration, and crash recovery while maintaining fast query performance.
+TaskStore implements the **Bead Store pattern** from Steve Yegge's Gas Town: records stored as one-line JSON in Git-backed JSONL files, with SQLite as a rebuildable query cache. This provides durability, version control, collaboration, and crash recovery while maintaining fast query performance.
+
+TaskStore is a **generic infrastructure library** that can store any type implementing the `Record` trait.
 
 ## The Bead Store Pattern (from Gas Town)
 
@@ -16,13 +18,35 @@ Steve Yegge's Gas Town stores work items as "Beads":
 - **Query** = SQLite index rebuilt from JSONL for fast lookups
 - **Updates** = Append-only (multiple lines for same ID, latest wins)
 
-**Key insight:** Beads are **work items**, not just data. They track:
-1. What needs to be done
-2. Who's doing it
-3. Current status
-4. Dependencies
+**Key insight:** Beads are **work items**, not just data. They track state, identity, relationships, and changes over time.
 
-## Three Storage Layers
+## Core Concepts
+
+### The Record Trait
+
+TaskStore is designed to store any type that implements the `Record` trait:
+
+```rust
+pub trait Record: Serialize + DeserializeOwned + Clone + Send + Sync + 'static {
+    /// Unique identifier for this record
+    fn id(&self) -> &str;
+
+    /// Timestamp when this record was last updated (Unix epoch milliseconds)
+    fn updated_at(&self) -> i64;
+
+    /// Type name for this record (used for JSONL file routing)
+    fn type_name() -> &'static str where Self: Sized;
+}
+```
+
+**Examples of Record types:**
+- `Plan` - A high-level project or goal
+- `Task` - A discrete unit of work
+- `User` - A person or agent in the system
+- `Event` - A state change or notification
+- `Message` - Communication between entities
+
+### Two Storage Layers
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -30,11 +54,10 @@ Steve Yegge's Gas Town stores work items as "Beads":
 │                  (Source of Truth, in Git)                   │
 │                                                              │
 │  .taskstore/                                                 │
-│  ├── prds.jsonl           ← Requirements (Epics)            │
-│  ├── task-specs.jsonl     ← Work units (Beads)              │
-│  ├── executions.jsonl     ← Worker assignments              │
-│  ├── workflows.jsonl      ← Templates (Formulas)            │
-│  └── dependencies.jsonl   ← Coordination                     │
+│  ├── plans.jsonl          ← Example: High-level plans       │
+│  ├── tasks.jsonl          ← Example: Work items             │
+│  ├── users.jsonl          ← Example: User records           │
+│  └── events.jsonl         ← Example: System events          │
 │                                                              │
 │  Properties:                                                 │
 │  - Append-only (never delete lines)                         │
@@ -54,11 +77,8 @@ Steve Yegge's Gas Town stores work items as "Beads":
 │  .taskstore/taskstore.db (in .gitignore)                    │
 │                                                              │
 │  Tables:                                                     │
-│  - prds                                                      │
-│  - task_specs                                                │
-│  - executions                                                │
-│  - workflows                                                 │
-│  - dependencies                                              │
+│  - records (generic record storage)                          │
+│  - record_indexes (per-type indexed fields)                  │
 │                                                              │
 │  Properties:                                                 │
 │  - Fast indexed queries                                      │
@@ -66,260 +86,255 @@ Steve Yegge's Gas Town stores work items as "Beads":
 │  - Can be deleted and rebuilt anytime                       │
 │  - NOT committed to Git                                     │
 └─────────────────────────────────────────────────────────────┘
-                            │
-                            │ queries
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   LAYER 3: Memory (Runtime)                  │
-│                                                              │
-│  - Coordinator registry (exec_id → channel)                 │
-│  - Pending queries (query_id → oneshot sender)              │
-│  - Subscription lists (event_type → [exec_ids])             │
-│  - Rate limiter counters                                     │
-│  - Loop context variables                                    │
-│                                                              │
-│  Properties:                                                 │
-│  - Ephemeral (lost on restart)                              │
-│  - Rebuilt on startup (loops re-register)                   │
-│  - No persistence needed                                     │
-└─────────────────────────────────────────────────────────────┘
 ```
 
-## What Goes Where
+## Generic Schema
 
-### In JSONL (and Git) - Work Items
+TaskStore uses a generic schema that works with any Record type:
 
-These are **work items with persistent identity** - the core of the Bead Store:
-
-#### 1. prds.jsonl - Requirements (Epics)
-
-**Purpose:** High-level work requirements, like epics in Jira
-
-**Example:**
-```jsonl
-{"id":"prd-550e8400","title":"Add User Authentication","status":"active","created_at":1704067200000,"updated_at":1704067200000,"review_passes":5,"content":"# PRD: Add User Authentication\n\n## Summary\nImplement JWT-based authentication...\n\n## Goals\n- Secure login/logout\n- Session management\n\n## Non-Goals\n- OAuth integration\n- LDAP support"}
-```
-
-**Why in Git:**
-- Requirements evolve (need version history)
-- Teams review/approve PRDs (collaboration)
-- Compare PRDs across branches
-- See how requirements changed over time
-
-**SQLite usage:** `SELECT * FROM prds WHERE status='active'`
-
-#### 2. task-specs.jsonl - Work Units (Beads)
-
-**Purpose:** Atomic work items, one per phase/task
-
-**Example:**
-```jsonl
-{"id":"ts-660e8400","prd_id":"prd-550e8400","phase_name":"Phase 1: Core Logic","status":"pending","workflow_name":"rust-development","dependencies":[],"content":"# Task: Implement Auth Core\n\nImplement the core authentication logic:\n- JWT generation\n- Token validation\n- Session storage"}
-{"id":"ts-770e8400","prd_id":"prd-550e8400","phase_name":"Phase 2: Tests","status":"pending","workflow_name":"rust-development","dependencies":["ts-660e8400"],"content":"# Task: Write Auth Tests\n\nTest coverage for:\n- Login flow\n- Token expiry\n- Invalid credentials"}
-```
-
-**Why in Git:**
-- Work breakdown changes (refine task definitions)
-- Dependencies shift as work progresses
-- Multiple devs need to see the work queue
-- Track what's assigned to whom
-
-**SQLite usage:**
+### records table
 ```sql
-SELECT * FROM task_specs
-WHERE status='pending'
-  AND NOT EXISTS (
-    SELECT 1 FROM dependencies
-    WHERE to_exec_id = task_specs.assigned_to
-  )
+CREATE TABLE records (
+    id TEXT PRIMARY KEY,
+    record_type TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    data TEXT NOT NULL  -- Full JSON of the record
+);
+
+CREATE INDEX idx_records_type ON records(record_type);
+CREATE INDEX idx_records_updated ON records(updated_at);
 ```
 
-#### 3. workflows.jsonl - Templates (Formulas)
-
-**Purpose:** Reusable AWL workflow definitions
-
-**Example:**
-```jsonl
-{"id":"wf-880e8400","name":"rust-development","version":"1.0","created_at":1704067200000,"updated_at":1704067200000,"content":"workflow:\n  name: rust-development\n  version: \"1.0\"\n  before:\n    - action: shell\n      command: \"cargo init --bin\"\n  foreach:\n    items: \"{ts.phases}\"\n    steps:\n      - action: prompt-agent\n        model: \"claude-opus-4.5\"\n        prompt: \"Implement {foreach.item}...\"\n      - action: shell\n        command: \"cargo check\"\n      - action: shell\n        command: \"cargo test\""}
-```
-
-**Why in Git:**
-- Workflows are code (need version control)
-- Teams iterate on workflow templates
-- Different projects customize workflows
-- Compare workflow versions
-
-**SQLite usage:** `SELECT content FROM workflows WHERE name='rust-development'`
-
-#### 4. executions.jsonl - Worker Assignments
-
-**Purpose:** Track which loop (worker) is executing which task
-
-**Example:**
-```jsonl
-{"id":"exec-990e8400","ts_id":"ts-660e8400","worktree_path":"/tmp/taskdaemon/worktrees/exec-990e8400","branch_name":"feature/auth-phase1","status":"running","started_at":1704074400000,"updated_at":1704078000000,"completed_at":null,"current_phase":"Phase 1","iteration_count":7,"error_message":null}
-{"id":"exec-990e8400","ts_id":"ts-660e8400","worktree_path":"/tmp/taskdaemon/worktrees/exec-990e8400","branch_name":"feature/auth-phase1","status":"running","started_at":1704074400000,"updated_at":1704079000000,"completed_at":null,"current_phase":"Phase 1","iteration_count":8,"error_message":null}
-```
-
-**Note:** Multiple lines for same ID (exec-990e8400) - this is normal and expected!
-
-**Why in Git:**
-- **Crash recovery:** Know what was running, can resume
-- **Status visibility:** Team sees in-progress work
-- **Audit trail:** Who did what, when
-- **Resume capability:** Restart from last iteration
-
-**SQLite usage:** `SELECT * FROM executions WHERE status='running'`
-
-#### 5. dependencies.jsonl - Coordination Messages
-
-**Purpose:** Record inter-task communication (notify/query/share)
-
-**Example:**
-```jsonl
-{"id":"dep-aa0e8400","from_exec_id":"exec-990e8400","to_exec_id":null,"dependency_type":"notify","created_at":1704078000000,"resolved_at":1704078000000,"payload":"{\"event_type\":\"phase_complete\",\"phase\":\"Phase 1\"}"}
-{"id":"dep-bb0e8400","from_exec_id":"exec-990e8400","to_exec_id":"exec-cc0e8400","dependency_type":"query","created_at":1704078100000,"resolved_at":1704078105000,"payload":"{\"query_id\":\"q-123\",\"question\":\"What is the API URL?\",\"answer\":\"http://localhost:8080\"}"}
-```
-
-**Why in Git:**
-- **Coordination history:** See how tasks interacted
-- **Debugging:** Why did task X wait for task Y?
-- **Audit:** Track all inter-task communication
-
-**SQLite usage:** `SELECT * FROM dependencies WHERE resolved_at IS NULL`
-
-### In SQLite Only - Query Cache
-
-**Purpose:** Fast indexed lookups
-
-**Contents:** Exact copy of JSONL data, but structured in tables with indexes
-
-**Examples:**
+### record_indexes table (optional, for custom queries)
 ```sql
--- Find all pending tasks ready to run
-SELECT * FROM task_specs ts
-WHERE ts.status = 'pending'
-  AND NOT EXISTS (
-    SELECT 1 FROM task_specs dep
-    JOIN JSONL_to_list(ts.dependencies) d ON dep.id = d.value
-    WHERE dep.status != 'complete'
-  );
+CREATE TABLE record_indexes (
+    record_id TEXT NOT NULL,
+    record_type TEXT NOT NULL,
+    field_name TEXT NOT NULL,
+    field_value TEXT NOT NULL,
+    FOREIGN KEY(record_id) REFERENCES records(id)
+);
 
--- Find all running executions
-SELECT * FROM executions WHERE status = 'running';
-
--- Find execution by worktree path
-SELECT * FROM executions WHERE worktree_path = '/tmp/taskdaemon/worktrees/exec-990e8400';
+CREATE INDEX idx_record_indexes_type_field ON record_indexes(record_type, field_name, field_value);
 ```
 
-**Why not in Git:**
-- Derived data (can rebuild from JSONL anytime)
-- Binary file (git diffs useless)
-- Changes constantly (every write)
+## Usage Examples
 
-**Rebuild strategy:**
-```bash
-rm .taskstore/taskstore.db
-taskstore sync  # Rebuilds from JSONL
+### Example 1: Storing Plans and Tasks
+
+```rust
+#[derive(Serialize, Deserialize, Clone)]
+struct Plan {
+    id: String,
+    title: String,
+    status: String,
+    updated_at: i64,
+}
+
+impl Record for Plan {
+    fn id(&self) -> &str { &self.id }
+    fn updated_at(&self) -> i64 { self.updated_at }
+    fn type_name() -> &'static str { "plan" }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Task {
+    id: String,
+    plan_id: String,
+    name: String,
+    status: String,
+    updated_at: i64,
+}
+
+impl Record for Task {
+    fn id(&self) -> &str { &self.id }
+    fn updated_at(&self) -> i64 { self.updated_at }
+    fn type_name() -> &'static str { "task" }
+}
 ```
 
-### In Memory Only - Runtime State
+**JSONL Example (plans.jsonl):**
+```jsonl
+{"id":"plan-001","title":"Build Authentication System","status":"active","updated_at":1704067200000}
+{"id":"plan-002","title":"Add Payment Integration","status":"planning","updated_at":1704067300000}
+```
 
-**Not persisted anywhere:**
+**JSONL Example (tasks.jsonl):**
+```jsonl
+{"id":"task-001","plan_id":"plan-001","name":"Implement JWT tokens","status":"pending","updated_at":1704067200000}
+{"id":"task-002","plan_id":"plan-001","name":"Add login endpoint","status":"pending","updated_at":1704067210000}
+{"id":"task-001","plan_id":"plan-001","name":"Implement JWT tokens","status":"in_progress","updated_at":1704067800000}
+{"id":"task-001","plan_id":"plan-001","name":"Implement JWT tokens","status":"complete","updated_at":1704070400000}
+```
 
-1. **Coordinator registry:** `HashMap<ExecId, Sender<CoordMessage>>`
-   - Changes every time a loop spawns/dies
-   - Rebuilt on startup (loops re-register)
+Note: task-001 appears three times with different statuses. This is the append-only pattern - latest wins.
 
-2. **Pending queries:** `HashMap<QueryId, Oneshot<Result<String>>>`
-   - Resolved within seconds
-   - Outstanding queries timeout on restart
+### Example 2: Storing Users and Events
 
-3. **Subscription lists:** `HashMap<EventType, Vec<ExecId>>`
-   - Runtime registration
-   - Loops re-subscribe on startup
+```rust
+#[derive(Serialize, Deserialize, Clone)]
+struct User {
+    id: String,
+    name: String,
+    email: String,
+    active: bool,
+    updated_at: i64,
+}
 
-4. **Rate limiter counters:** `HashMap<ExecId, VecDeque<Instant>>`
-   - Sliding window, resets on restart
+impl Record for User {
+    fn id(&self) -> &str { &self.id }
+    fn updated_at(&self) -> i64 { self.updated_at }
+    fn type_name() -> &'static str { "user" }
+}
 
-5. **Loop context variables:** `HashMap<String, Value>` (per loop)
-   - Temporary during iteration
-   - Discarded after iteration completes
+#[derive(Serialize, Deserialize, Clone)]
+struct Event {
+    id: String,
+    user_id: String,
+    event_type: String,
+    payload: String,
+    updated_at: i64,
+}
+
+impl Record for Event {
+    fn id(&self) -> &str { &self.id }
+    fn updated_at(&self) -> i64 { self.updated_at }
+    fn type_name() -> &'static str { "event" }
+}
+```
+
+**JSONL Example (users.jsonl):**
+```jsonl
+{"id":"user-001","name":"Alice","email":"alice@example.com","active":true,"updated_at":1704067200000}
+{"id":"user-002","name":"Bob","email":"bob@example.com","active":true,"updated_at":1704067300000}
+{"id":"user-001","name":"Alice","email":"alice@newdomain.com","active":true,"updated_at":1704070000000}
+```
+
+**JSONL Example (events.jsonl):**
+```jsonl
+{"id":"evt-001","user_id":"user-001","event_type":"login","payload":"{\"ip\":\"192.168.1.1\"}","updated_at":1704067500000}
+{"id":"evt-002","user_id":"user-001","event_type":"task_complete","payload":"{\"task_id\":\"task-001\"}","updated_at":1704070400000}
+```
 
 ## Write Operations
 
-### Creating a Work Item
+### Creating a Record
 
 ```rust
-pub fn create_task_spec(&mut self, ts: TaskSpec) -> Result<String> {
+pub fn create<T: Record>(&mut self, record: T) -> Result<String> {
     // 1. Append to JSONL (durability first)
-    let json = serde_json::to_string(&ts)?;
+    let type_name = T::type_name();
+    let json = serde_json::to_string(&record)?;
+    let path = self.store_dir.join(format!("{}.jsonl", type_name));
+
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(".taskstore/task-specs.jsonl")?;
+        .open(path)?;
     writeln!(file, "{}", json)?;
     file.sync_all()?;  // fsync to disk
 
     // 2. Insert into SQLite (query performance)
     self.db.execute(
-        "INSERT INTO task_specs (id, prd_id, phase_name, status, ...)
-         VALUES (?1, ?2, ?3, ?4, ...)",
-        params![ts.id, ts.prd_id, ts.phase_name, ts.status.to_string()],
+        "INSERT INTO records (id, record_type, updated_at, data)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![record.id(), type_name, record.updated_at(), json],
     )?;
 
-    Ok(ts.id)
+    Ok(record.id().to_string())
 }
 ```
 
-### Updating a Work Item (Append-Only)
+### Updating a Record (Append-Only)
 
 ```rust
-pub fn update_execution(&mut self, exec_id: &str, exec: Execution) -> Result<()> {
+pub fn update<T: Record>(&mut self, record: T) -> Result<()> {
     // 1. Append to JSONL (yes, duplicate ID - that's the pattern!)
-    let json = serde_json::to_string(&exec)?;
+    let type_name = T::type_name();
+    let json = serde_json::to_string(&record)?;
+    let path = self.store_dir.join(format!("{}.jsonl", type_name));
+
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(".taskstore/executions.jsonl")?;
+        .open(path)?;
     writeln!(file, "{}", json)?;
     file.sync_all()?;
 
     // 2. Update SQLite (single record)
     self.db.execute(
-        "UPDATE executions
-         SET status = ?1, updated_at = ?2, iteration_count = ?3, current_phase = ?4
-         WHERE id = ?5",
-        params![exec.status.to_string(), exec.updated_at, exec.iteration_count, exec.current_phase, exec.id],
+        "UPDATE records
+         SET updated_at = ?1, data = ?2
+         WHERE id = ?3 AND record_type = ?4",
+        params![record.updated_at(), json, record.id(), type_name],
     )?;
 
     Ok(())
 }
 ```
 
-**Result:** JSONL has multiple lines for same exec_id, each with different iteration_count and updated_at.
+**Result:** JSONL has multiple lines for same ID, each with different data and updated_at.
 
 ## Read Operations
 
 ### Fast Queries (SQLite)
 
 ```rust
-pub fn list_active_executions(&self) -> Result<Vec<Execution>> {
+pub fn get<T: Record>(&self, id: &str) -> Result<Option<T>> {
+    let type_name = T::type_name();
+
     let mut stmt = self.db.prepare(
-        "SELECT * FROM executions WHERE status = 'running' ORDER BY started_at"
+        "SELECT data FROM records WHERE id = ?1 AND record_type = ?2"
     )?;
 
-    let executions = stmt.query_map([], |row| {
-        Ok(Execution {
-            id: row.get(0)?,
-            ts_id: row.get(1)?,
-            status: row.get(4)?.parse().unwrap(),
-            // ... map all fields
-        })
+    let result = stmt.query_row(params![id, type_name], |row| {
+        let json: String = row.get(0)?;
+        Ok(serde_json::from_str(&json).unwrap())
+    });
+
+    match result {
+        Ok(record) => Ok(Some(record)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub fn list<T: Record>(&self) -> Result<Vec<T>> {
+    let type_name = T::type_name();
+
+    let mut stmt = self.db.prepare(
+        "SELECT data FROM records WHERE record_type = ?1 ORDER BY updated_at"
+    )?;
+
+    let records = stmt.query_map([type_name], |row| {
+        let json: String = row.get(0)?;
+        Ok(serde_json::from_str(&json).unwrap())
     })?
     .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(executions)
+    Ok(records)
+}
+```
+
+### Custom Filtering
+
+```rust
+// Using record_indexes for efficient filtering
+pub fn find_by_field(&self, record_type: &str, field_name: &str, field_value: &str) -> Result<Vec<String>> {
+    let mut stmt = self.db.prepare(
+        "SELECT r.data FROM records r
+         JOIN record_indexes ri ON r.id = ri.record_id
+         WHERE ri.record_type = ?1
+           AND ri.field_name = ?2
+           AND ri.field_value = ?3"
+    )?;
+
+    let records = stmt.query_map(params![record_type, field_name, field_value], |row| {
+        row.get(0)
+    })?
+    .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(records)
 }
 ```
 
@@ -328,41 +343,59 @@ pub fn list_active_executions(&self) -> Result<Vec<Execution>> {
 ```rust
 pub fn sync(&mut self) -> Result<()> {
     // 1. Read all JSONL files
-    let executions = self.read_jsonl::<Execution>("executions.jsonl")?;
+    for entry in fs::read_dir(&self.store_dir)? {
+        let entry = entry?;
+        let path = entry.path();
 
-    // 2. Deduplicate: keep latest record per ID (highest updated_at)
-    let mut latest: HashMap<String, Execution> = HashMap::new();
-    for exec in executions {
-        match latest.get(&exec.id) {
-            Some(existing) if existing.updated_at > exec.updated_at => continue,
-            _ => { latest.insert(exec.id.clone(), exec); }
+        if path.extension() != Some(OsStr::new("jsonl")) {
+            continue;
         }
-    }
 
-    // 3. Clear SQLite table
-    self.db.execute("DELETE FROM executions", [])?;
+        let records = self.read_jsonl(&path)?;
 
-    // 4. Insert deduplicated records
-    for exec in latest.values() {
-        self.db.execute(
-            "INSERT INTO executions (id, ts_id, status, ...) VALUES (?1, ?2, ?3, ...)",
-            params![exec.id, exec.ts_id, exec.status.to_string()],
-        )?;
+        // 2. Deduplicate: keep latest record per ID (highest updated_at)
+        let mut latest: HashMap<String, (i64, String)> = HashMap::new();
+        for (id, updated_at, json) in records {
+            match latest.get(&id) {
+                Some((existing_ts, _)) if *existing_ts > updated_at => continue,
+                _ => { latest.insert(id, (updated_at, json)); }
+            }
+        }
+
+        // 3. Extract record type from filename
+        let record_type = path.file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| Error::msg("Invalid filename"))?;
+
+        // 4. Upsert into SQLite
+        for (id, (updated_at, json)) in latest {
+            self.db.execute(
+                "INSERT OR REPLACE INTO records (id, record_type, updated_at, data)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![id, record_type, updated_at, json],
+            )?;
+        }
     }
 
     Ok(())
 }
 
-fn read_jsonl<T: DeserializeOwned>(&self, filename: &str) -> Result<Vec<T>> {
-    let path = PathBuf::from(".taskstore").join(filename);
+fn read_jsonl(&self, path: &Path) -> Result<Vec<(String, i64, String)>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
 
     let mut records = Vec::new();
     for line in reader.lines() {
         let line = line?;
-        let record: T = serde_json::from_str(&line)?;
-        records.push(record);
+        let value: serde_json::Value = serde_json::from_str(&line)?;
+
+        let id = value["id"].as_str()
+            .ok_or_else(|| Error::msg("Missing id field"))?
+            .to_string();
+        let updated_at = value["updated_at"].as_i64()
+            .ok_or_else(|| Error::msg("Missing updated_at field"))?;
+
+        records.push((id, updated_at, line));
     }
 
     Ok(records)
@@ -371,16 +404,16 @@ fn read_jsonl<T: DeserializeOwned>(&self, filename: &str) -> Result<Vec<T>> {
 
 ## Git Integration
 
-### Committing Work State
+### Committing Records
 
 ```bash
-# Developer checkpoint
+# Checkpoint your data
 cd /path/to/repo
 git add .taskstore/*.jsonl
-git commit -m "Checkpoint: 3 loops running, auth core complete"
+git commit -m "Checkpoint: updated 15 tasks, added 3 users"
 
-# Executions.jsonl might have 50 lines for 3 executions
-# (each execution updated ~15-20 times)
+# JSONL files might have hundreds of lines for dozens of records
+# (each record updated multiple times)
 # That's fine - it's append-only history
 ```
 
@@ -411,11 +444,11 @@ Custom merge driver (`.gitattributes`):
 
 **Example conflict:**
 ```
-Base:    {"id":"exec-123","iteration_count":5,"updated_at":1000}
-Ours:    {"id":"exec-123","iteration_count":7,"updated_at":1001}
-Theirs:  {"id":"exec-123","iteration_count":6,"updated_at":1002}
+Base:    {"id":"task-123","status":"pending","updated_at":1000}
+Ours:    {"id":"task-123","status":"in_progress","updated_at":1001}
+Theirs:  {"id":"task-123","status":"complete","updated_at":1002}
 
-Merged:  {"id":"exec-123","iteration_count":6,"updated_at":1002}  # Theirs wins (newer)
+Merged:  {"id":"task-123","status":"complete","updated_at":1002}  # Theirs wins (newer)
 ```
 
 ## Compaction (Optional)
@@ -430,90 +463,88 @@ taskstore compact
 
 **Algorithm:**
 ```rust
-pub fn compact(&mut self, filename: &str) -> Result<()> {
+pub fn compact(&mut self, type_name: &str) -> Result<()> {
+    let path = self.store_dir.join(format!("{}.jsonl", type_name));
+
     // 1. Read all records
-    let records = self.read_jsonl::<Execution>(filename)?;
+    let records = self.read_jsonl(&path)?;
 
     // 2. Keep only latest per ID
-    let mut latest: HashMap<String, Execution> = HashMap::new();
-    for record in records {
-        match latest.get(&record.id) {
-            Some(existing) if existing.updated_at > record.updated_at => continue,
-            _ => { latest.insert(record.id.clone(), record); }
+    let mut latest: HashMap<String, (i64, String)> = HashMap::new();
+    for (id, updated_at, json) in records {
+        match latest.get(&id) {
+            Some((existing_ts, _)) if *existing_ts > updated_at => continue,
+            _ => { latest.insert(id, (updated_at, json)); }
         }
     }
 
     // 3. Write to temp file
-    let temp_path = format!("{}.tmp", filename);
+    let temp_path = path.with_extension("jsonl.tmp");
     let mut temp = File::create(&temp_path)?;
-    for record in latest.values() {
-        let json = serde_json::to_string(record)?;
+    for (_, (_, json)) in latest.iter() {
         writeln!(temp, "{}", json)?;
     }
     temp.sync_all()?;
 
     // 4. Atomic rename
-    fs::rename(temp_path, filename)?;
+    fs::rename(temp_path, path)?;
 
     Ok(())
 }
 ```
 
-**Result:** JSONL shrinks from 5000 lines to 50 lines (100 executions × 50 updates = 5000, compacted to 100 latest)
+**Result:** JSONL shrinks from 5000 lines to 50 lines (50 records × 100 updates = 5000, compacted to 50 latest)
 
-## Crash Recovery Example
+## Crash Recovery
 
 ### Scenario:
 
 ```
-12:00 PM - TaskDaemon starts
-12:01 PM - Spawn 3 execution loops (exec-001, exec-002, exec-003)
-          → Written to executions.jsonl
-12:05 PM - exec-001 iteration 5 completes
-          → Appended to executions.jsonl
-12:10 PM - exec-002 iteration 3 completes
-          → Appended to executions.jsonl
-12:15 PM - exec-001 iteration 6 completes
-          → Appended to executions.jsonl
+12:00 PM - Application starts
+12:01 PM - Create 3 tasks
+          → Written to tasks.jsonl
+12:05 PM - Update task-001 to "in_progress"
+          → Appended to tasks.jsonl
+12:10 PM - Update task-002 to "in_progress"
+          → Appended to tasks.jsonl
+12:15 PM - Update task-001 to "complete"
+          → Appended to tasks.jsonl
 12:16 PM - **CRASH** (power failure)
 ```
 
 ### On Restart:
 
 ```
-12:20 PM - TaskDaemon restarts
+12:20 PM - Application restarts
           → Calls store.sync()
-          → Reads executions.jsonl (6 lines)
+          → Reads tasks.jsonl (6 lines)
           → Deduplicates to 3 latest records
           → Rebuilds SQLite
 
-12:21 PM - Queries SQLite: "SELECT * FROM executions WHERE status='running'"
-          → Finds 3 running executions
+12:21 PM - Queries SQLite: "SELECT * FROM records WHERE record_type='task'"
+          → Finds 3 tasks with correct states:
+            - task-001: "complete"
+            - task-002: "in_progress"
+            - task-003: "pending"
 
-12:22 PM - For each running execution:
-          → Checks if worktree exists
-          → If yes: Resume from last iteration
-          → If no: Mark as failed (cleanup issue)
+12:22 PM - Application continues from last known state
 
-12:23 PM - exec-001 resumes from iteration 6
-          - exec-002 resumes from iteration 3
-          - exec-003 resumes from iteration 1
-
-Work continues without data loss!
+Data integrity maintained!
 ```
 
 ## Benefits of the Bead Store Pattern
 
 1. **Durability:** JSONL writes are fsync'd, survive crashes
-2. **Version Control:** Full git history of all work items
-3. **Collaboration:** Multiple devs see same work queue
-4. **Audit Trail:** Every status change recorded
+2. **Version Control:** Full git history of all records
+3. **Collaboration:** Multiple users see same data
+4. **Audit Trail:** Every state change recorded
 5. **Crash Recovery:** Resume exactly where we left off
 6. **Fast Queries:** SQLite indexes for performance
 7. **Simple Consistency:** JSONL is truth, SQLite is cache
 8. **Human Readable:** Can grep/inspect JSONL files directly
 9. **Merge Capability:** Git merges handled automatically
 10. **Flexible:** Append-only means never delete history
+11. **Generic:** Works with any type implementing Record trait
 
 ## Anti-Patterns to Avoid
 
@@ -530,13 +561,65 @@ Work continues without data loss!
 - Use SQLite for queries
 - JSONL is for durability and git
 
-❌ **Don't persist ephemeral state**
-- Coordinator registry, subscriptions → memory only
-- Rebuild on restart (loops re-register)
-
 ❌ **Don't trust SQLite as source of truth**
 - If JSONL and SQLite disagree, JSONL wins
 - Always rebuild from JSONL on conflict
+
+❌ **Don't forget to implement Record trait correctly**
+- Must have unique, stable IDs
+- Must have monotonically increasing updated_at
+- Must implement all required trait methods
+
+## Extension Points
+
+### Custom Indexes
+
+For frequently-queried fields, populate the `record_indexes` table:
+
+```rust
+pub fn create_index<T: Record>(&mut self, record: &T, field_name: &str, field_value: &str) -> Result<()> {
+    self.db.execute(
+        "INSERT INTO record_indexes (record_id, record_type, field_name, field_value)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![record.id(), T::type_name(), field_name, field_value],
+    )?;
+    Ok(())
+}
+```
+
+### Custom Filters
+
+Implement type-specific filtering logic:
+
+```rust
+pub trait Filter<T: Record> {
+    fn matches(&self, record: &T) -> bool;
+}
+
+pub fn filter<T: Record, F: Filter<T>>(&self, filter: F) -> Result<Vec<T>> {
+    let all_records = self.list::<T>()?;
+    Ok(all_records.into_iter().filter(|r| filter.matches(r)).collect())
+}
+```
+
+### Validation
+
+Add validation hooks before writes:
+
+```rust
+pub trait Validator<T: Record> {
+    fn validate(&self, record: &T) -> Result<()>;
+}
+
+pub fn create_with_validation<T: Record, V: Validator<T>>(
+    &mut self,
+    record: T,
+    validator: V
+) -> Result<String> {
+    validator.validate(&record)?;
+    self.create(record)
+}
+```
 
 ## References
 
