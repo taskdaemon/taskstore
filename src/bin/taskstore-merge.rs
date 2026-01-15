@@ -29,7 +29,7 @@ fn run() -> Result<()> {
 
     if args.len() != 4 {
         eprintln!("Usage: taskstore-merge <ancestor> <ours> <theirs>");
-        eprintln!("Example: taskstore-merge prds.jsonl.base prds.jsonl prds.jsonl.theirs");
+        eprintln!("Example: taskstore-merge plans.jsonl.base plans.jsonl plans.jsonl.theirs");
         return Ok(());
     }
 

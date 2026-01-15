@@ -1,6 +1,6 @@
 # TaskStore
 
-**Persistent state management with SQLite+JSONL+Git integration**
+**Generic persistent state management with SQLite+JSONL+Git integration**
 
 TaskStore is a Rust library and CLI for managing persistent state with a unique architecture that combines:
 - **SQLite** for fast queries
@@ -14,7 +14,7 @@ TaskStore is a Rust library and CLI for managing persistent state with a unique 
 - **Automatic syncing**: Git hooks automatically rebuild SQLite from JSONL
 - **Schema versioning**: Automatic migrations with version tracking
 - **Append-only semantics**: JSONL files track full history, latest version wins
-- **Type-safe API**: Full Rust type safety with serde serialization
+- **Type-safe API**: Generic Record trait for any Rust type
 
 ## Installation
 
@@ -39,70 +39,116 @@ This installs:
 
 ## Usage
 
-### Initialize a store
+### Implementing the Record Trait
+
+Define your own types that implement the `Record` trait:
+
+```rust
+use taskstore::{Record, IndexValue};
+use serde::{Serialize, Deserialize};
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Plan {
+    id: String,
+    title: String,
+    status: String,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl Record for Plan {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn updated_at(&self) -> i64 {
+        self.updated_at
+    }
+
+    fn collection_name() -> &'static str {
+        "plans"  // Stored in plans.jsonl
+    }
+
+    fn indexed_fields(&self) -> HashMap<String, IndexValue> {
+        let mut fields = HashMap::new();
+        fields.insert("status".to_string(), IndexValue::String(self.status.clone()));
+        fields
+    }
+}
+```
+
+### CRUD Operations
+
+```rust
+use taskstore::{Store, now_ms};
+
+let mut store = Store::open(".")?;
+
+// Create
+let plan = Plan {
+    id: "plan-001".to_string(),
+    title: "My Plan".to_string(),
+    status: "active".to_string(),
+    created_at: now_ms(),
+    updated_at: now_ms(),
+};
+store.create(plan)?;
+
+// Get
+let plan: Option<Plan> = store.get("plan-001")?;
+
+// Update
+let mut plan = plan.unwrap();
+plan.status = "complete".to_string();
+plan.updated_at = now_ms();
+store.update(plan)?;
+
+// Delete
+store.delete::<Plan>("plan-001")?;
+
+// List all
+let plans: Vec<Plan> = store.list(&[])?;
+```
+
+### Filtering
+
+```rust
+use taskstore::{Filter, FilterOp, IndexValue};
+
+// List with filters
+let active_plans: Vec<Plan> = store.list(&[
+    Filter {
+        field: "status".to_string(),
+        op: FilterOp::Eq,
+        value: IndexValue::String("active".to_string()),
+    }
+])?;
+
+// Multiple filters (AND logic)
+let filtered: Vec<Plan> = store.list(&[
+    Filter {
+        field: "status".to_string(),
+        op: FilterOp::Eq,
+        value: IndexValue::String("active".to_string()),
+    },
+    Filter {
+        field: "priority".to_string(),
+        op: FilterOp::Gt,
+        value: IndexValue::Int(5),
+    },
+])?;
+```
+
+### CLI Commands
 
 ```bash
+# Initialize/sync database
 taskstore sync
+
+# Install git hooks
+taskstore install-hooks
 ```
-
-This creates:
-- `.taskstore/` directory
-- `store.db` SQLite database
-- `.version` file for schema tracking
-- `*.jsonl` files for each entity type
-
-### List PRDs
-
-```bash
-# List all PRDs
-taskstore list-prds
-
-# Filter by status
-taskstore list-prds --status active
-```
-
-### List task specifications
-
-```bash
-taskstore list-task-specs <PRD_ID>
-```
-
-### List executions
-
-```bash
-# List all executions
-taskstore list-executions
-
-# Filter by status
-taskstore list-executions --status running
-```
-
-### Show detailed information
-
-```bash
-# Show PRD details
-taskstore show prd <ID>
-
-# Show task spec details
-taskstore show ts <ID>
-
-# Show execution details
-taskstore show execution <ID>
-```
-
-### View statistics
-
-```bash
-taskstore stats
-```
-
-### Manual sync
-
-```bash
-taskstore sync
-```
-
-Rebuilds the SQLite database from JSONL files. This happens automatically via git hooks, but you can trigger it manually.
 
 ## Architecture
 
@@ -113,7 +159,7 @@ TaskStore uses a "Bead Store" pattern where:
 1. **JSONL is the source of truth**
    - Append-only log of all changes
    - Git-friendly plain text format
-   - Each record has `id`, `created_at`, `updated_at` fields
+   - Each record has `id`, `updated_at` fields
    - Multiple versions of same record can exist
 
 2. **SQLite is a derived cache**
@@ -127,59 +173,40 @@ TaskStore uses a "Bead Store" pattern where:
    - Then written to SQLite
    - If SQLite fails, JSONL still has the data
 
-### Data Model
+### Collection-Based Storage
+
+Records are stored in `{collection}.jsonl` files based on `collection_name()`:
 
 ```
-PRD (Product Requirements Document)
-├── id: String
-├── title: String
-├── description: String
-├── status: draft | ready | active | complete | cancelled
-├── review_passes: u8
-├── content: String (markdown)
-└── timestamps: created_at, updated_at
+.taskstore/
+├── plans.jsonl         # Plan records
+├── tasks.jsonl         # Task records
+├── users.jsonl         # User records
+└── taskstore.db        # SQLite cache
+```
 
-TaskSpec (Task Specification)
-├── id: String
-├── prd_id: String
-├── phase_name: String
-├── description: String
-├── status: pending | running | complete | failed
-├── workflow_name: Option<String>
-├── assigned_to: Option<String>
-├── content: String
-└── timestamps: created_at, updated_at
+### Generic Schema
 
-Execution (Loop Instance)
-├── id: String
-├── ts_id: String (task spec ID)
-├── worktree_path: String
-├── branch_name: String
-├── status: running | paused | complete | failed | stopped
-├── current_phase: Option<String>
-├── iteration_count: u32
-├── error_message: Option<String>
-└── timestamps: started_at, updated_at, completed_at
+```sql
+-- All records stored here
+CREATE TABLE records (
+    collection TEXT NOT NULL,
+    id TEXT NOT NULL,
+    data_json TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (collection, id)
+);
 
-Dependency (Coordination)
-├── id: String
-├── from_exec_id: String
-├── to_exec_id: String
-├── dependency_type: notify | query | share
-├── payload: Option<String>
-└── timestamps: created_at, resolved_at
-
-Workflow (AWL Definition)
-├── id: String
-├── name: String
-├── description: String
-├── awl_code: String
-└── timestamps: created_at, updated_at
-
-RepoState (Sync Tracking)
-├── repo_path: String (primary key)
-├── last_synced_commit: String
-└── updated_at: i64
+-- Indexed fields for filtering
+CREATE TABLE record_indexes (
+    collection TEXT NOT NULL,
+    id TEXT NOT NULL,
+    field_name TEXT NOT NULL,
+    field_value_str TEXT,
+    field_value_int INTEGER,
+    field_value_bool INTEGER,
+    PRIMARY KEY (collection, id, field_name)
+);
 ```
 
 ### Git Integration
@@ -213,19 +240,28 @@ All hooks run `taskstore sync` to keep SQLite in sync with JSONL:
 
 Hooks are idempotent and won't break existing hooks.
 
-### Schema Versioning
+### Filtering System
 
-Schema version is tracked in `.version` file:
+The `Record` trait allows types to define indexed fields:
 
+```rust
+fn indexed_fields(&self) -> HashMap<String, IndexValue> {
+    let mut fields = HashMap::new();
+    fields.insert("status".to_string(), IndexValue::String(self.status.clone()));
+    fields.insert("priority".to_string(), IndexValue::Int(self.priority));
+    fields.insert("archived".to_string(), IndexValue::Bool(self.archived));
+    fields
+}
 ```
-1  # Current schema version
-```
 
-When opening a store:
-1. Check `.version` file
-2. If version mismatch, run migrations
-3. If database exists but schema missing, auto-sync from JSONL
-4. Update `.version` file
+Supported filter operators:
+- `FilterOp::Eq` - Equal to
+- `FilterOp::Ne` - Not equal to
+- `FilterOp::Gt` - Greater than
+- `FilterOp::Lt` - Less than
+- `FilterOp::Gte` - Greater than or equal
+- `FilterOp::Lte` - Less than or equal
+- `FilterOp::Contains` - String contains (SQL LIKE)
 
 ### Sync Logic
 
@@ -235,7 +271,7 @@ When syncing:
 2. Read all JSONL files
 3. For each record with same ID, keep latest `updated_at`
 4. Insert latest versions into SQLite
-5. Rebuild indexes
+5. Skip tombstone records (`{"deleted": true}`)
 
 This ensures SQLite always reflects the current state from JSONL.
 
@@ -247,16 +283,15 @@ This ensures SQLite always reflects the current state from JSONL.
 taskstore/
 ├── src/
 │   ├── lib.rs           # Library entry point
-│   ├── models.rs        # Data models and enums
+│   ├── record.rs        # Record trait and IndexValue
+│   ├── filter.rs        # Filter and FilterOp
 │   ├── store.rs         # Core Store implementation
 │   ├── jsonl.rs         # JSONL file operations
 │   ├── main.rs          # CLI application
-│   ├── cli.rs           # CLI argument parsing (legacy)
-│   ├── config.rs        # Configuration (legacy)
 │   └── bin/
 │       └── taskstore-merge.rs  # Git merge driver
 ├── docs/
-│   └── taskstore-design.md     # Design document
+│   └── *.md             # Design documentation
 ├── Cargo.toml
 └── build.rs             # Build script for git version
 ```
@@ -268,33 +303,63 @@ cargo test
 ```
 
 Test coverage includes:
-- Model serialization
-- JSONL append and read operations
+- Record trait implementation
+- Filter operations
 - Store CRUD operations
-- Sync logic
+- JSONL read/write
 - Merge driver three-way merge scenarios
 
-### Running Examples
-
-Create a test PRD:
+### Example Implementation
 
 ```rust
-use taskstore::{Store, Prd, PrdStatus, now_ms};
+use taskstore::{Record, IndexValue, Store, now_ms};
+use serde::{Serialize, Deserialize};
+use std::collections::HashMap;
 
-let mut store = Store::open(".")?;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Task {
+    id: String,
+    title: String,
+    status: String,
+    priority: i64,
+    updated_at: i64,
+}
 
-let prd = Prd {
-    id: "prd-001".to_string(),
-    title: "Example PRD".to_string(),
-    description: "Test description".to_string(),
-    created_at: now_ms(),
-    updated_at: now_ms(),
-    status: PrdStatus::Draft,
-    review_passes: 0,
-    content: "# Example\n\nContent here".to_string(),
-};
+impl Record for Task {
+    fn id(&self) -> &str {
+        &self.id
+    }
 
-store.create_prd(prd)?;
+    fn updated_at(&self) -> i64 {
+        self.updated_at
+    }
+
+    fn collection_name() -> &'static str {
+        "tasks"
+    }
+
+    fn indexed_fields(&self) -> HashMap<String, IndexValue> {
+        let mut fields = HashMap::new();
+        fields.insert("status".to_string(), IndexValue::String(self.status.clone()));
+        fields.insert("priority".to_string(), IndexValue::Int(self.priority));
+        fields
+    }
+}
+
+fn main() -> eyre::Result<()> {
+    let mut store = Store::open(".")?;
+
+    let task = Task {
+        id: "task-001".to_string(),
+        title: "Example Task".to_string(),
+        status: "pending".to_string(),
+        priority: 10,
+        updated_at: now_ms(),
+    };
+
+    store.create(task)?;
+    Ok(())
+}
 ```
 
 ## Design Philosophy
@@ -304,19 +369,20 @@ store.create_prd(prd)?;
 3. **Git-native**: Leverage git for version control and collaboration
 4. **Automatic resolution**: Use timestamps to auto-resolve most conflicts
 5. **Fail-safe**: If SQLite corrupts, regenerate from JSONL
-6. **Schema evolution**: Migrations live in code, version tracked in file
+6. **Generic**: No domain-specific types, works with any Record implementation
 
 ## Use Cases
 
-- **Concurrent agentic loops**: Multiple AI agents working on different tasks
+- **Concurrent processes**: Multiple processes working on different records
 - **Distributed teams**: Git-based collaboration with automatic conflict resolution
 - **Audit trails**: JSONL files preserve full history of changes
 - **Reproducibility**: Regenerate exact state from JSONL files
 - **Offline work**: Work offline, sync when reconnected
+- **Type flexibility**: Define your own domain types
 
 ## Performance
 
-- **Reads**: Fast queries via SQLite indexes
+- **Reads**: Fast queries via SQLite indexes on indexed fields
 - **Writes**: Append to JSONL (O(1)), then SQLite
 - **Sync**: Full rebuild from JSONL (typically <100ms for 1000s of records)
 - **Merge**: Three-way merge is O(n) where n = unique IDs
@@ -326,16 +392,8 @@ store.create_prd(prd)?;
 - JSONL files grow unbounded (no compaction yet)
 - Full sync on every merge (no incremental updates)
 - Timestamp-based conflict resolution (assumes synchronized clocks)
+- Indexed fields defined at compile time (can't add dynamically)
 - No built-in data validation beyond Rust types
-
-## Future Enhancements
-
-- JSONL compaction (remove old versions)
-- Incremental sync (only changed records)
-- Vector clocks for distributed conflict resolution
-- Web UI for visualization
-- Metrics and monitoring
-- Plugin system for custom workflows
 
 ## License
 
