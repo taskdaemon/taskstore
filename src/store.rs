@@ -22,7 +22,7 @@ pub struct Store {
 impl Store {
     /// Open or create a store at the given path
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let base_path = path.as_ref().join(".taskstore");
+        let base_path = path.as_ref().to_path_buf();
 
         // Create directory if it doesn't exist
         fs::create_dir_all(&base_path).context("Failed to create store directory")?;
