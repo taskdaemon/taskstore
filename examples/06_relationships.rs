@@ -222,7 +222,7 @@ fn get_child_categories(store: &Store, parent_id: &str) -> Result<Vec<Category>>
 
 fn main() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
-    let store_path = temp_dir.path().join(".taskstore");
+    let store_path = temp_dir.path().to_path_buf();
 
     println!("TaskStore Relationships Example");
     println!("================================\n");

@@ -42,7 +42,7 @@ impl Record for Note {
 fn main() -> Result<()> {
     // Create a temporary directory for this example
     let temp_dir = tempfile::tempdir()?;
-    let store_path = temp_dir.path().join(".taskstore");
+    let store_path = temp_dir.path().to_path_buf();
 
     println!("TaskStore Basic CRUD Example");
     println!("============================\n");

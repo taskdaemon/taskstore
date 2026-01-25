@@ -40,14 +40,16 @@ impl Record for Counter {
 
 fn main() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
-    let store_path = temp_dir.path().join(".taskstore");
+    // Store::open auto-adds .taskstore subdir
+    let base_path = temp_dir.path().to_path_buf();
+    let store_path = temp_dir.path().join(".taskstore"); // For direct file access
 
     println!("TaskStore Concurrent Access Example");
     println!("====================================\n");
 
     // Create initial store and counter
     {
-        let mut store = Store::open(&store_path)?;
+        let mut store = Store::open(&base_path)?;
         store.create(Counter {
             id: "main-counter".to_string(),
             name: "Main Counter".to_string(),
@@ -63,19 +65,19 @@ fn main() -> Result<()> {
     let num_threads = 10;
     let records_per_thread = 10;
     let barrier = Arc::new(Barrier::new(num_threads));
-    let store_path_arc = Arc::new(store_path.clone());
+    let base_path_arc = Arc::new(base_path.clone());
 
     let handles: Vec<_> = (0..num_threads)
         .map(|thread_id| {
             let barrier = Arc::clone(&barrier);
-            let store_path = Arc::clone(&store_path_arc);
+            let base_path = Arc::clone(&base_path_arc);
 
             thread::spawn(move || {
                 // Wait for all threads to be ready
                 barrier.wait();
 
                 // Open store (each thread gets its own connection)
-                let mut store = Store::open(store_path.as_ref()).unwrap();
+                let mut store = Store::open(base_path.as_ref()).unwrap();
 
                 for i in 0..records_per_thread {
                     let counter = Counter {
@@ -102,7 +104,7 @@ fn main() -> Result<()> {
     // Verify all records were created
     println!("2. Verifying all records...");
     {
-        let store = Store::open(&store_path)?;
+        let store = Store::open(&base_path)?;
         let all_counters: Vec<Counter> = store.list(&[])?;
 
         // Should have 1 initial + (10 threads * 10 records) = 101 records
@@ -151,10 +153,10 @@ fn main() -> Result<()> {
     // Demonstrate sequential updates (same record)
     println!("4. Sequential updates to same record...");
     {
-        let store_path = store_path.clone();
+        let base_path_clone = base_path.clone();
         let handles: Vec<_> = (0..5)
             .map(|i| {
-                let path = store_path.clone();
+                let path = base_path_clone.clone();
                 thread::spawn(move || {
                     // Small delay to stagger threads
                     thread::sleep(std::time::Duration::from_millis(i * 10));
@@ -184,7 +186,7 @@ fn main() -> Result<()> {
         }
 
         // Check final value
-        let store = Store::open(&store_path)?;
+        let store = Store::open(&base_path)?;
         let counter: Counter = store.get("main-counter")?.unwrap();
         println!("   Final counter value: {}", counter.value);
         println!("   (Note: Due to race conditions, may not be exactly 5)");

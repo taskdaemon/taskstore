@@ -121,7 +121,7 @@ impl Record for Comment {
 
 fn main() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
-    let store_path = temp_dir.path().join(".taskstore");
+    let store_path = temp_dir.path().to_path_buf();
 
     println!("TaskStore Multiple Collections Example");
     println!("======================================\n");

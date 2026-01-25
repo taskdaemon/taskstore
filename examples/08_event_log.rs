@@ -130,7 +130,7 @@ fn get_events_by_type(store: &Store, event_type: &str) -> Result<Vec<Event>> {
 
 fn main() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
-    let store_path = temp_dir.path().join(".taskstore");
+    let store_path = temp_dir.path().to_path_buf();
 
     println!("TaskStore Event Log Example");
     println!("============================\n");

@@ -1,6 +1,6 @@
 // Generic store implementation using JSONL + SQLite
 
-use crate::filter::Filter;
+use crate::filter::{Filter, FilterOp};
 use crate::jsonl;
 use crate::record::{IndexValue, Record};
 use eyre::{Context, Result, eyre};
@@ -21,8 +21,10 @@ pub struct Store {
 
 impl Store {
     /// Open or create a store at the given path
+    ///
+    /// The store will be created in a `.taskstore` subdirectory of the given path.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let base_path = path.as_ref().to_path_buf();
+        let base_path = path.as_ref().join(".taskstore");
 
         // Create directory if it doesn't exist
         fs::create_dir_all(&base_path).context("Failed to create store directory")?;
@@ -261,6 +263,26 @@ impl Store {
         )?;
 
         Ok(())
+    }
+
+    /// Delete all records matching an indexed field value.
+    /// Returns the number of records deleted.
+    pub fn delete_by_index<T: Record>(&mut self, field: &str, value: IndexValue) -> Result<usize> {
+        // First list the matching records
+        let filters = vec![Filter {
+            field: field.to_string(),
+            op: FilterOp::Eq,
+            value,
+        }];
+        let records: Vec<T> = self.list(&filters)?;
+
+        // Delete each one
+        let count = records.len();
+        for record in records {
+            self.delete::<T>(record.id())?;
+        }
+
+        Ok(count)
     }
 
     /// List records with optional filtering
@@ -850,9 +872,9 @@ mod tests {
     #[test]
     fn test_store_open_creates_directory() {
         let temp = TempDir::new().unwrap();
-        let store_path = temp.path().join(".taskstore");
 
-        let _store = Store::open(&store_path).unwrap();
+        let _store = Store::open(temp.path()).unwrap();
+        let store_path = temp.path().join(".taskstore");
         assert!(store_path.exists());
         assert!(store_path.join("taskstore.db").exists());
         assert!(store_path.join(".gitignore").exists());
@@ -862,8 +884,7 @@ mod tests {
     #[test]
     fn test_generic_create() {
         let temp = TempDir::new().unwrap();
-        let store_path = temp.path().join(".taskstore");
-        let mut store = Store::open(&store_path).unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
 
         let record = TestRecord {
             id: "rec1".to_string(),
@@ -878,7 +899,7 @@ mod tests {
         assert_eq!(id, "rec1");
 
         // Verify JSONL file was created
-        let jsonl_path = store_path.join("test_records.jsonl");
+        let jsonl_path = temp.path().join(".taskstore/test_records.jsonl");
         assert!(jsonl_path.exists());
 
         // Verify record in SQLite
@@ -894,8 +915,7 @@ mod tests {
     #[test]
     fn test_generic_get_nonexistent() {
         let temp = TempDir::new().unwrap();
-        let store_path = temp.path().join(".taskstore");
-        let store = Store::open(&store_path).unwrap();
+        let store = Store::open(temp.path()).unwrap();
 
         let result: Option<TestRecord> = store.get("nonexistent").unwrap();
         assert!(result.is_none());
@@ -904,8 +924,7 @@ mod tests {
     #[test]
     fn test_generic_update() {
         let temp = TempDir::new().unwrap();
-        let store_path = temp.path().join(".taskstore");
-        let mut store = Store::open(&store_path).unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
 
         // Create initial record
         let mut record = TestRecord {
@@ -940,8 +959,7 @@ mod tests {
     #[test]
     fn test_generic_delete() {
         let temp = TempDir::new().unwrap();
-        let store_path = temp.path().join(".taskstore");
-        let mut store = Store::open(&store_path).unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
 
         // Create record
         let record = TestRecord {
@@ -962,7 +980,7 @@ mod tests {
         assert!(retrieved.is_none());
 
         // Verify tombstone in JSONL
-        let jsonl_path = store_path.join("test_records.jsonl");
+        let jsonl_path = temp.path().join(".taskstore/test_records.jsonl");
         let content = fs::read_to_string(jsonl_path).unwrap();
         assert!(content.contains("\"deleted\":true"));
     }
@@ -970,8 +988,7 @@ mod tests {
     #[test]
     fn test_generic_list_no_filters() {
         let temp = TempDir::new().unwrap();
-        let store_path = temp.path().join(".taskstore");
-        let mut store = Store::open(&store_path).unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
 
         // Create multiple records
         for i in 1..=3 {
@@ -994,8 +1011,7 @@ mod tests {
     #[test]
     fn test_generic_list_with_filter() {
         let temp = TempDir::new().unwrap();
-        let store_path = temp.path().join(".taskstore");
-        let mut store = Store::open(&store_path).unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
 
         // Create records with different statuses
         let record1 = TestRecord {

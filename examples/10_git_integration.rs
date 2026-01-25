@@ -53,9 +53,9 @@ fn main() -> Result<()> {
     Command::new("git").args(["init"]).current_dir(repo_path).output()?;
     println!("   Initialized git repo at: {}\n", repo_path.display());
 
-    // Create taskstore in the repo
+    // Create taskstore in the repo (Store::open auto-adds .taskstore subdir)
+    let mut store = Store::open(repo_path)?;
     let store_path = repo_path.join(".taskstore");
-    let mut store = Store::open(&store_path)?;
 
     // Create some config records
     println!("2. Creating configuration records...");

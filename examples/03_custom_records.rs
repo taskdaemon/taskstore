@@ -158,7 +158,7 @@ impl Record for Customer {
 
 fn main() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
-    let store_path = temp_dir.path().join(".taskstore");
+    let store_path = temp_dir.path().to_path_buf();
 
     println!("TaskStore Custom Records Example");
     println!("=================================\n");

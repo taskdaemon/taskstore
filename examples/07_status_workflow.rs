@@ -201,7 +201,7 @@ fn close_issue(store: &mut Store, issue_id: &str) -> Result<()> {
 
 fn main() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
-    let store_path = temp_dir.path().join(".taskstore");
+    let store_path = temp_dir.path().to_path_buf();
 
     println!("TaskStore Status Workflow Example");
     println!("==================================\n");

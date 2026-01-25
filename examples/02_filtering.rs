@@ -46,7 +46,7 @@ impl Record for Task {
 
 fn main() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
-    let store_path = temp_dir.path().join(".taskstore");
+    let store_path = temp_dir.path().to_path_buf();
 
     println!("TaskStore Filtering Example");
     println!("===========================\n");
