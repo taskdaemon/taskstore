@@ -59,6 +59,11 @@ impl Store {
         &self.base_path
     }
 
+    /// Get a reference to the SQLite database connection
+    pub fn db(&self) -> &Connection {
+        &self.db
+    }
+
     /// Create database schema
     fn create_schema(&self) -> Result<()> {
         debug!("Creating database schema");
@@ -424,6 +429,8 @@ impl Store {
         id: &str,
         fields: &std::collections::HashMap<String, IndexValue>,
     ) -> Result<()> {
+        debug!(collection, id, field_count = fields.len(), "update_indexes_tx: called");
+
         // Delete old indexes
         tx.execute(
             "DELETE FROM record_indexes WHERE collection = ?1 AND id = ?2",
@@ -432,6 +439,7 @@ impl Store {
 
         // Insert new indexes
         for (field_name, value) in fields {
+            debug!(collection, id, field_name, ?value, "update_indexes_tx: inserting index");
             Self::validate_field_name(field_name)?;
 
             match value {
@@ -842,9 +850,9 @@ mod tests {
     #[test]
     fn test_store_open_creates_directory() {
         let temp = TempDir::new().unwrap();
-
-        let _store = Store::open(temp.path()).unwrap();
         let store_path = temp.path().join(".taskstore");
+
+        let _store = Store::open(&store_path).unwrap();
         assert!(store_path.exists());
         assert!(store_path.join("taskstore.db").exists());
         assert!(store_path.join(".gitignore").exists());
@@ -854,7 +862,8 @@ mod tests {
     #[test]
     fn test_generic_create() {
         let temp = TempDir::new().unwrap();
-        let mut store = Store::open(temp.path()).unwrap();
+        let store_path = temp.path().join(".taskstore");
+        let mut store = Store::open(&store_path).unwrap();
 
         let record = TestRecord {
             id: "rec1".to_string(),
@@ -869,7 +878,7 @@ mod tests {
         assert_eq!(id, "rec1");
 
         // Verify JSONL file was created
-        let jsonl_path = temp.path().join(".taskstore/test_records.jsonl");
+        let jsonl_path = store_path.join("test_records.jsonl");
         assert!(jsonl_path.exists());
 
         // Verify record in SQLite
@@ -885,7 +894,8 @@ mod tests {
     #[test]
     fn test_generic_get_nonexistent() {
         let temp = TempDir::new().unwrap();
-        let store = Store::open(temp.path()).unwrap();
+        let store_path = temp.path().join(".taskstore");
+        let store = Store::open(&store_path).unwrap();
 
         let result: Option<TestRecord> = store.get("nonexistent").unwrap();
         assert!(result.is_none());
@@ -894,7 +904,8 @@ mod tests {
     #[test]
     fn test_generic_update() {
         let temp = TempDir::new().unwrap();
-        let mut store = Store::open(temp.path()).unwrap();
+        let store_path = temp.path().join(".taskstore");
+        let mut store = Store::open(&store_path).unwrap();
 
         // Create initial record
         let mut record = TestRecord {
@@ -929,7 +940,8 @@ mod tests {
     #[test]
     fn test_generic_delete() {
         let temp = TempDir::new().unwrap();
-        let mut store = Store::open(temp.path()).unwrap();
+        let store_path = temp.path().join(".taskstore");
+        let mut store = Store::open(&store_path).unwrap();
 
         // Create record
         let record = TestRecord {
@@ -950,7 +962,7 @@ mod tests {
         assert!(retrieved.is_none());
 
         // Verify tombstone in JSONL
-        let jsonl_path = temp.path().join(".taskstore/test_records.jsonl");
+        let jsonl_path = store_path.join("test_records.jsonl");
         let content = fs::read_to_string(jsonl_path).unwrap();
         assert!(content.contains("\"deleted\":true"));
     }
@@ -958,7 +970,8 @@ mod tests {
     #[test]
     fn test_generic_list_no_filters() {
         let temp = TempDir::new().unwrap();
-        let mut store = Store::open(temp.path()).unwrap();
+        let store_path = temp.path().join(".taskstore");
+        let mut store = Store::open(&store_path).unwrap();
 
         // Create multiple records
         for i in 1..=3 {
@@ -981,7 +994,8 @@ mod tests {
     #[test]
     fn test_generic_list_with_filter() {
         let temp = TempDir::new().unwrap();
-        let mut store = Store::open(temp.path()).unwrap();
+        let store_path = temp.path().join(".taskstore");
+        let mut store = Store::open(&store_path).unwrap();
 
         // Create records with different statuses
         let record1 = TestRecord {

@@ -9,3 +9,6 @@ pub mod store;
 pub use filter::{Filter, FilterOp};
 pub use record::{IndexValue, Record};
 pub use store::{Store, now_ms};
+
+// Re-export rusqlite for CLI use
+pub use rusqlite;

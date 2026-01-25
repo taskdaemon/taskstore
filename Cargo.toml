@@ -36,4 +36,7 @@ uuid = { version = "1.19.0", features = ["v7"] }
 
 [dev-dependencies]
 tempfile = "3.24.0"
-# For build.rs if needed
+
+# Examples are auto-discovered from examples/ directory
+# Run one: cargo run --example 01_basic_crud
+# Run all: otto examples
