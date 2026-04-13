@@ -1230,6 +1230,13 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let mut store = Store::open(temp.path()).unwrap();
 
+        // Pre-populate with a valid record so we test against existing state
+        store
+            .create(make_record("existing", "Existing", "active", 0, 500))
+            .unwrap();
+        let jsonl_path = temp.path().join(".taskstore/test_records.jsonl");
+        let size_before = fs::metadata(&jsonl_path).unwrap().len();
+
         let records = vec![
             make_record("dup", "First", "active", 1, 1000),
             make_record("dup", "Second", "active", 2, 2000),
@@ -1239,15 +1246,26 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Duplicate ID"));
 
-        // Nothing written - JSONL file must not exist
-        let jsonl_path = temp.path().join(".taskstore/test_records.jsonl");
-        assert!(!jsonl_path.exists());
+        // JSONL must be unchanged - no new bytes appended
+        let size_after = fs::metadata(&jsonl_path).unwrap().len();
+        assert_eq!(size_before, size_after, "JSONL must not grow on validation failure");
+
+        // SQLite count must be unchanged
+        let all: Vec<TestRecord> = store.list(&[]).unwrap();
+        assert_eq!(all.len(), 1);
     }
 
     #[test]
     fn test_create_many_invalid_id() {
         let temp = TempDir::new().unwrap();
         let mut store = Store::open(temp.path()).unwrap();
+
+        // Pre-populate so we test against existing state
+        store
+            .create(make_record("existing", "Existing", "active", 0, 500))
+            .unwrap();
+        let jsonl_path = temp.path().join(".taskstore/test_records.jsonl");
+        let size_before = fs::metadata(&jsonl_path).unwrap().len();
 
         let records = vec![
             make_record("good", "Good", "active", 1, 1000),
@@ -1257,9 +1275,12 @@ mod tests {
         let result = store.create_many(records);
         assert!(result.is_err());
 
-        // Nothing written - preparation phase failed before I/O
-        let jsonl_path = temp.path().join(".taskstore/test_records.jsonl");
-        assert!(!jsonl_path.exists());
+        // JSONL must be unchanged - preparation phase failed before any I/O
+        let size_after = fs::metadata(&jsonl_path).unwrap().len();
+        assert_eq!(size_before, size_after, "JSONL must not grow on invalid ID");
+
+        let all: Vec<TestRecord> = store.list(&[]).unwrap();
+        assert_eq!(all.len(), 1);
     }
 
     #[test]
@@ -1307,7 +1328,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_many_jsonl_atomicity() {
+    fn test_create_many_jsonl_batch_write() {
         let temp = TempDir::new().unwrap();
         let mut store = Store::open(temp.path()).unwrap();
 
@@ -1318,7 +1339,7 @@ mod tests {
         ];
         store.create_many(records).unwrap();
 
-        // All 3 records must appear in the JSONL file
+        // All 3 records must appear in the JSONL file as 3 lines
         let jsonl_path = temp.path().join(".taskstore/test_records.jsonl");
         let content = fs::read_to_string(&jsonl_path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
@@ -1326,6 +1347,36 @@ mod tests {
         assert!(content.contains("\"id\":\"r1\""));
         assert!(content.contains("\"id\":\"r2\""));
         assert!(content.contains("\"id\":\"r3\""));
+    }
+
+    #[test]
+    fn test_create_many_jsonl_heals_sqlite() {
+        // Documents the eventual-consistency contract: if JSONL was written but SQLite
+        // is stale (e.g. after a crash), re-opening the store recovers from JSONL.
+        let temp = TempDir::new().unwrap();
+
+        // Write records via create_many
+        {
+            let mut store = Store::open(temp.path()).unwrap();
+            let records = vec![
+                make_record("r1", "A", "active", 1, 1000),
+                make_record("r2", "B", "active", 2, 2000),
+            ];
+            store.create_many(records).unwrap();
+        }
+
+        // Simulate stale SQLite by deleting the db file - forces sync on next open
+        let db_path = temp.path().join(".taskstore/taskstore.db");
+        fs::remove_file(&db_path).unwrap();
+
+        // Re-open: store must rebuild SQLite from JSONL
+        let mut store = Store::open(temp.path()).unwrap();
+        store.rebuild_indexes::<TestRecord>().unwrap();
+
+        let all: Vec<TestRecord> = store.list(&[]).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(store.get::<TestRecord>("r1").unwrap().is_some());
+        assert!(store.get::<TestRecord>("r2").unwrap().is_some());
     }
 
     // A record type with an invalid indexed field name (hyphen not allowed)
@@ -1355,9 +1406,16 @@ mod tests {
 
     #[test]
     fn test_create_many_validation_before_write() {
+        // Uses BadFieldRecord (hyphenated indexed field name) to trigger prep-phase failure.
+        // Tests against an existing store to prove we don't append to an existing JSONL file.
         let temp = TempDir::new().unwrap();
         let mut store = Store::open(temp.path()).unwrap();
 
+        // Pre-populate bad_field_records with one valid-ish record using a workaround:
+        // We can't use BadFieldRecord directly for the pre-population since create() will
+        // also fail on the bad field name. Instead we verify the empty-file case and rely
+        // on test_create_many_duplicate_ids / test_create_many_invalid_id for the
+        // existing-state coverage of validation-before-write.
         let records = vec![
             BadFieldRecord {
                 id: "b1".to_string(),
