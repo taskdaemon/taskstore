@@ -1162,4 +1162,221 @@ mod tests {
         assert!(Store::validate_field_name("").is_err());
         assert!(Store::validate_field_name(&"a".repeat(65)).is_err());
     }
+
+    fn make_record(id: &str, name: &str, status: &str, count: i64, ts: i64) -> TestRecord {
+        TestRecord {
+            id: id.to_string(),
+            name: name.to_string(),
+            status: status.to_string(),
+            count,
+            active: true,
+            updated_at: ts,
+        }
+    }
+
+    #[test]
+    fn test_create_many_basic() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+
+        let records = vec![
+            make_record("r1", "Alice", "active", 1, 1000),
+            make_record("r2", "Bob", "draft", 2, 2000),
+            make_record("r3", "Carol", "active", 3, 3000),
+        ];
+
+        let ids = store.create_many(records).unwrap();
+        assert_eq!(ids, vec!["r1", "r2", "r3"]);
+
+        // All retrievable via get
+        assert!(store.get::<TestRecord>("r1").unwrap().is_some());
+        assert!(store.get::<TestRecord>("r2").unwrap().is_some());
+        assert!(store.get::<TestRecord>("r3").unwrap().is_some());
+
+        // All retrievable via list
+        let all: Vec<TestRecord> = store.list(&[]).unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn test_create_many_empty() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+
+        let ids = store.create_many::<TestRecord>(vec![]).unwrap();
+        assert!(ids.is_empty());
+
+        // No JSONL file created
+        let jsonl_path = temp.path().join(".taskstore/test_records.jsonl");
+        assert!(!jsonl_path.exists());
+    }
+
+    #[test]
+    fn test_create_many_single() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+
+        let record = make_record("solo", "Solo", "active", 7, 1000);
+        let ids = store.create_many(vec![record.clone()]).unwrap();
+        assert_eq!(ids, vec!["solo"]);
+
+        let retrieved = store.get::<TestRecord>("solo").unwrap().unwrap();
+        assert_eq!(retrieved.name, "Solo");
+        assert_eq!(retrieved.count, 7);
+    }
+
+    #[test]
+    fn test_create_many_duplicate_ids() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+
+        let records = vec![
+            make_record("dup", "First", "active", 1, 1000),
+            make_record("dup", "Second", "active", 2, 2000),
+        ];
+
+        let result = store.create_many(records);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Duplicate ID"));
+
+        // Nothing written - JSONL file must not exist
+        let jsonl_path = temp.path().join(".taskstore/test_records.jsonl");
+        assert!(!jsonl_path.exists());
+    }
+
+    #[test]
+    fn test_create_many_invalid_id() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+
+        let records = vec![
+            make_record("good", "Good", "active", 1, 1000),
+            make_record("   ", "Whitespace ID", "active", 2, 2000),
+        ];
+
+        let result = store.create_many(records);
+        assert!(result.is_err());
+
+        // Nothing written - preparation phase failed before I/O
+        let jsonl_path = temp.path().join(".taskstore/test_records.jsonl");
+        assert!(!jsonl_path.exists());
+    }
+
+    #[test]
+    fn test_create_many_indexes() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+
+        let records = vec![
+            make_record("r1", "Alice", "active", 10, 1000),
+            make_record("r2", "Bob", "draft", 20, 2000),
+            make_record("r3", "Carol", "active", 30, 3000),
+        ];
+        store.create_many(records).unwrap();
+
+        // Filter by indexed field
+        let filters = vec![Filter {
+            field: "status".to_string(),
+            op: crate::filter::FilterOp::Eq,
+            value: IndexValue::String("active".to_string()),
+        }];
+        let active: Vec<TestRecord> = store.list(&filters).unwrap();
+        assert_eq!(active.len(), 2);
+        let active_ids: Vec<&str> = active.iter().map(|r| r.id.as_str()).collect();
+        assert!(active_ids.contains(&"r1"));
+        assert!(active_ids.contains(&"r3"));
+    }
+
+    #[test]
+    fn test_create_many_overwrites() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+
+        // Create initial record
+        store.create(make_record("r1", "Original", "draft", 1, 1000)).unwrap();
+
+        // create_many with same ID should overwrite (INSERT OR REPLACE)
+        store
+            .create_many(vec![make_record("r1", "Overwritten", "active", 99, 2000)])
+            .unwrap();
+
+        let retrieved = store.get::<TestRecord>("r1").unwrap().unwrap();
+        assert_eq!(retrieved.name, "Overwritten");
+        assert_eq!(retrieved.count, 99);
+        assert_eq!(retrieved.updated_at, 2000);
+    }
+
+    #[test]
+    fn test_create_many_jsonl_atomicity() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+
+        let records = vec![
+            make_record("r1", "A", "active", 1, 1000),
+            make_record("r2", "B", "active", 2, 2000),
+            make_record("r3", "C", "active", 3, 3000),
+        ];
+        store.create_many(records).unwrap();
+
+        // All 3 records must appear in the JSONL file
+        let jsonl_path = temp.path().join(".taskstore/test_records.jsonl");
+        let content = fs::read_to_string(&jsonl_path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(content.contains("\"id\":\"r1\""));
+        assert!(content.contains("\"id\":\"r2\""));
+        assert!(content.contains("\"id\":\"r3\""));
+    }
+
+    // A record type with an invalid indexed field name (hyphen not allowed)
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct BadFieldRecord {
+        id: String,
+        updated_at: i64,
+    }
+
+    impl Record for BadFieldRecord {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn updated_at(&self) -> i64 {
+            self.updated_at
+        }
+        fn collection_name() -> &'static str {
+            "bad_field_records"
+        }
+        fn indexed_fields(&self) -> HashMap<String, IndexValue> {
+            let mut fields = HashMap::new();
+            // "bad-field" contains a hyphen - validate_field_name will reject this
+            fields.insert("bad-field".to_string(), IndexValue::String("x".to_string()));
+            fields
+        }
+    }
+
+    #[test]
+    fn test_create_many_validation_before_write() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+
+        let records = vec![
+            BadFieldRecord {
+                id: "b1".to_string(),
+                updated_at: 1000,
+            },
+            BadFieldRecord {
+                id: "b2".to_string(),
+                updated_at: 2000,
+            },
+        ];
+
+        let result = store.create_many(records);
+        assert!(result.is_err());
+
+        // Critical: JSONL must NOT exist - field validation failed in prep phase before any I/O
+        let jsonl_path = temp.path().join(".taskstore/bad_field_records.jsonl");
+        assert!(
+            !jsonl_path.exists(),
+            "JSONL must not be written when preparation phase fails"
+        );
+    }
 }
