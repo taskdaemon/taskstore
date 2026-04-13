@@ -184,34 +184,17 @@ impl Store {
     // Generic CRUD API
     // ========================================================================
 
-    /// Create a new record
+    /// Create a new record.
+    ///
+    /// Delegates to `create_many` for a single record, ensuring identical
+    /// validation-before-write semantics (all validation and serialization
+    /// happens before any JSONL or SQLite I/O).
     pub fn create<T: Record>(&mut self, record: T) -> Result<String> {
-        let collection = T::collection_name();
-        Self::validate_collection_name(collection)?;
-
-        let id = record.id().to_string();
-        Self::validate_id(&id)?;
-
-        // 1. Append to JSONL
-        self.append_jsonl_generic(collection, &record)?;
-
-        // 2. Insert into SQLite with transaction
-        let tx = self.db.transaction()?;
-
-        let data_json = serde_json::to_string(&record).context("Failed to serialize record")?;
-
-        tx.execute(
-            "INSERT OR REPLACE INTO records (collection, id, data_json, updated_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![collection, &id, data_json, record.updated_at()],
-        )?;
-
-        // 3. Update indexes
-        Self::update_indexes_tx(&tx, collection, &id, &record.indexed_fields())?;
-
-        tx.commit()?;
-
-        Ok(id)
+        self.create_many(vec![record]).map(|ids| {
+            ids.into_iter()
+                .next()
+                .expect("create_many with one record yields one id")
+        })
     }
 
     /// Create multiple records of the same type in a single batch.
@@ -468,28 +451,6 @@ impl Store {
     // ========================================================================
     // Helper methods
     // ========================================================================
-
-    fn append_jsonl_generic<T: Record>(&self, collection: &str, record: &T) -> Result<()> {
-        let jsonl_path = self.base_path.join(format!("{}.jsonl", collection));
-
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&jsonl_path)
-            .context("Failed to open JSONL file for appending")?;
-
-        // Acquire exclusive lock before writing
-        file.lock_exclusive().context("Failed to acquire file lock")?;
-
-        let json = serde_json::to_string(record)?;
-
-        use std::io::Write;
-        writeln!(file, "{}", json)?;
-        file.sync_all()?;
-
-        // Lock is automatically released when file is dropped
-        Ok(())
-    }
 
     fn append_jsonl_raw(&self, collection: &str, value: &serde_json::Value) -> Result<()> {
         let jsonl_path = self.base_path.join(format!("{}.jsonl", collection));
