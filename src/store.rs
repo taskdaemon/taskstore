@@ -1,6 +1,7 @@
 // Generic store implementation using JSONL + SQLite
 
-use crate::filter::{Filter, FilterOp};
+use crate::corruption::{CorruptionEntry, CorruptionError, ListResult, truncate_raw};
+use crate::filter::{Filter, FilterOp, match_filter};
 use crate::jsonl;
 use crate::record::{IndexValue, Record};
 use eyre::{Context, Result, eyre};
@@ -446,6 +447,69 @@ impl Store {
         }
 
         Ok(results)
+    }
+
+    /// List records by reading JSONL directly, returning valid records plus
+    /// a per-line diagnostic for any malformed line.
+    ///
+    /// This is a sweep/audit path, **not** a hot read. Every call re-parses
+    /// the JSONL file from disk, bypassing the SQLite cache, and applies
+    /// filters in Rust without SQL index pushdown. Use `list<T>` for hot
+    /// reads where corruption diagnostics are not needed.
+    ///
+    /// Behavior is documented in
+    /// `docs/design/2026-04-25-list-tolerant.md`. Highlights:
+    /// - Reads JSONL directly. Does not trigger `sync()`.
+    /// - Tombstones are filtered from `records`, not counted as corruption.
+    /// - Malformed JSON lines, lines missing an `id`, and lines that do not
+    ///   deserialize to `T` all surface in `corruption` with their on-disk
+    ///   line number.
+    /// - Last-write-wins applies before typed deserialization: if a newer
+    ///   line for an id is invalid for `T`, the older valid line is **not**
+    ///   resurrected; the id surfaces as `TypeMismatch` corruption.
+    pub fn list_tolerant<T: Record>(&self, filters: &[Filter]) -> Result<ListResult<T>> {
+        let collection = T::collection_name();
+        Self::validate_collection_name(collection)?;
+        for f in filters {
+            Self::validate_field_name(&f.field)?;
+        }
+
+        let jsonl_path = self.base_path.join(format!("{}.jsonl", collection));
+        let (map, mut corruption) = jsonl::read_jsonl_latest_with_corruption(&jsonl_path)?;
+
+        let mut records: Vec<T> = Vec::with_capacity(map.len());
+        for (_id, (line_no, value)) in map {
+            // Drop tombstones (well-formed deletion markers), matching
+            // sync()'s tombstone filter. They are not corruption.
+            if value.get("deleted").and_then(|v| v.as_bool()).unwrap_or(false) {
+                continue;
+            }
+
+            // Re-serialize once. On success, we have the deserialized T and
+            // discard the string. On failure, the string is reused as `raw`
+            // for the TypeMismatch CorruptionEntry.
+            let value_str = value.to_string();
+            match serde_json::from_str::<T>(&value_str) {
+                Ok(record) => records.push(record),
+                Err(e) => {
+                    corruption.push(CorruptionEntry {
+                        file: jsonl_path.clone(),
+                        line: line_no,
+                        raw: truncate_raw(value_str),
+                        error: CorruptionError::TypeMismatch { msg: e.to_string() },
+                    });
+                }
+            }
+        }
+
+        if !filters.is_empty() {
+            records.retain(|r| {
+                let fields = r.indexed_fields();
+                filters.iter().all(|f| match_filter(&fields, f))
+            });
+        }
+
+        Ok(ListResult { records, corruption })
     }
 
     // ========================================================================

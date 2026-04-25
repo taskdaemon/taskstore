@@ -1,6 +1,7 @@
 // Query filtering for generic records
 
 use crate::record::IndexValue;
+use std::collections::HashMap;
 
 /// Filter for querying records
 #[derive(Debug, Clone)]
@@ -37,6 +38,57 @@ impl FilterOp {
             FilterOp::Lte => "<=",
             FilterOp::Contains => "LIKE",
         }
+    }
+}
+
+/// In-Rust mirror of the SQL filter path used by `Store::list<T>`.
+///
+/// Returns `true` iff the record's indexed fields match the filter. Used by
+/// `Store::list_tolerant<T>`, which bypasses SQLite and therefore cannot use
+/// SQL filter pushdown.
+///
+/// Semantic carry-overs from the SQL path (`store.rs` list builder):
+/// - Field absent from `fields` → `false` (mirrors SQL `EXISTS` returning empty).
+/// - Filter value type does not match the indexed field's `IndexValue` variant
+///   → `false` (mirrors SQL keying off the typed columns).
+/// - `FilterOp::Contains` is ASCII-case-insensitive substring match (mirrors
+///   SQLite's `LIKE` default for ASCII). Non-ASCII case folding intentionally
+///   not handled - SQLite's `LIKE` does not handle it either.
+pub(crate) fn match_filter(fields: &HashMap<String, IndexValue>, f: &Filter) -> bool {
+    let field_value = match fields.get(&f.field) {
+        Some(v) => v,
+        None => return false,
+    };
+    match (field_value, &f.value) {
+        (IndexValue::String(a), IndexValue::String(b)) => match f.op {
+            FilterOp::Eq => a == b,
+            FilterOp::Ne => a != b,
+            FilterOp::Gt => a > b,
+            FilterOp::Lt => a < b,
+            FilterOp::Gte => a >= b,
+            FilterOp::Lte => a <= b,
+            FilterOp::Contains => a.to_ascii_lowercase().contains(&b.to_ascii_lowercase()),
+        },
+        (IndexValue::Int(a), IndexValue::Int(b)) => match f.op {
+            FilterOp::Eq => a == b,
+            FilterOp::Ne => a != b,
+            FilterOp::Gt => a > b,
+            FilterOp::Lt => a < b,
+            FilterOp::Gte => a >= b,
+            FilterOp::Lte => a <= b,
+            FilterOp::Contains => false,
+        },
+        (IndexValue::Bool(a), IndexValue::Bool(b)) => match f.op {
+            FilterOp::Eq => a == b,
+            FilterOp::Ne => a != b,
+            FilterOp::Gt => a > b,
+            FilterOp::Lt => a < b,
+            FilterOp::Gte => a >= b,
+            FilterOp::Lte => a <= b,
+            FilterOp::Contains => false,
+        },
+        // Type mismatch between indexed field and filter value
+        _ => false,
     }
 }
 
