@@ -951,6 +951,7 @@ pub fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::corruption::Category;
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
     use tempfile::TempDir;
@@ -1461,5 +1462,329 @@ mod tests {
             !jsonl_path.exists(),
             "JSONL must not be written when preparation phase fails"
         );
+    }
+
+    // ========================================================================
+    // list_tolerant<T> tests (Phase 3 of design doc)
+    // ========================================================================
+
+    fn jsonl_path_for(temp: &TempDir, collection: &str) -> std::path::PathBuf {
+        temp.path().join(format!(".taskstore/{}.jsonl", collection))
+    }
+
+    #[test]
+    fn test_list_tolerant_missing_jsonl() {
+        // Collection has never been written - directory exists, file does not.
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let result: ListResult<TestRecord> = store.list_tolerant(&[]).unwrap();
+        assert!(result.records.is_empty());
+        assert!(result.corruption.is_empty());
+    }
+
+    #[test]
+    fn test_list_tolerant_empty_jsonl() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let path = jsonl_path_for(&temp, "test_records");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "").unwrap();
+
+        let result: ListResult<TestRecord> = store.list_tolerant(&[]).unwrap();
+        assert!(result.records.is_empty());
+        assert!(result.corruption.is_empty());
+    }
+
+    #[test]
+    fn test_list_tolerant_happy_path() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+
+        store
+            .create_many(vec![
+                make_record("r1", "Alice", "active", 1, 1000),
+                make_record("r2", "Bob", "draft", 2, 2000),
+                make_record("r3", "Carol", "active", 3, 3000),
+            ])
+            .unwrap();
+
+        let result: ListResult<TestRecord> = store.list_tolerant(&[]).unwrap();
+        assert_eq!(result.records.len(), 3);
+        assert!(result.corruption.is_empty());
+    }
+
+    #[test]
+    fn test_list_tolerant_with_filter() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+
+        store
+            .create_many(vec![
+                make_record("r1", "Alice", "active", 1, 1000),
+                make_record("r2", "Bob", "draft", 2, 2000),
+                make_record("r3", "Carol", "active", 3, 3000),
+            ])
+            .unwrap();
+
+        let filters = vec![Filter {
+            field: "status".to_string(),
+            op: FilterOp::Eq,
+            value: IndexValue::String("active".to_string()),
+        }];
+        let result: ListResult<TestRecord> = store.list_tolerant(&filters).unwrap();
+        assert_eq!(result.records.len(), 2);
+        let ids: Vec<&str> = result.records.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"r1"));
+        assert!(ids.contains(&"r3"));
+    }
+
+    #[test]
+    fn test_list_tolerant_surfaces_three_corrupt_lines() {
+        // 3 distinct corruption shapes: Syntax, EOF-like truncation, MissingId.
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let path = jsonl_path_for(&temp, "test_records");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let valid_count = 100;
+        let mut content = String::new();
+        for i in 0..valid_count {
+            content.push_str(&format!(
+                "{{\"id\":\"r{}\",\"name\":\"n{}\",\"status\":\"active\",\"count\":{},\"active\":true,\"updated_at\":{}}}\n",
+                i, i, i, 1000 + i
+            ));
+        }
+        // Insert 3 corrupt lines at known positions: 5, 50, 90 (1-indexed: 6, 51, 91).
+        let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+        lines.insert(5, "{this is not json}".to_string()); // Syntax @ line 6
+        lines.insert(51, "{\"id\":\"truncated\",\"name\":\"".to_string()); // EOF-like @ line 52
+        lines.insert(91, "{\"name\":\"missing-id\",\"updated_at\":9999}".to_string()); // MissingId @ line 92
+        let combined = lines.join("\n") + "\n";
+        fs::write(&path, combined).unwrap();
+
+        let result: ListResult<TestRecord> = store.list_tolerant(&[]).unwrap();
+        assert_eq!(result.records.len(), valid_count);
+        assert_eq!(result.corruption.len(), 3);
+
+        let lines: Vec<u64> = result.corruption.iter().map(|c| c.line).collect();
+        assert!(lines.contains(&6));
+        assert!(lines.contains(&52));
+        assert!(lines.contains(&92));
+
+        // Each entry carries file, line, raw, error.
+        for entry in &result.corruption {
+            assert_eq!(entry.file, path);
+            assert!(entry.line > 0);
+            assert!(!entry.raw.is_empty());
+        }
+
+        // Classifications.
+        let mut saw_syntax = false;
+        let mut saw_eof = false;
+        let mut saw_missing_id = false;
+        for entry in &result.corruption {
+            match &entry.error {
+                CorruptionError::InvalidJson { category, .. } => match category {
+                    Category::Syntax => saw_syntax = true,
+                    Category::Eof => saw_eof = true,
+                    _ => {}
+                },
+                CorruptionError::MissingId => saw_missing_id = true,
+                _ => {}
+            }
+        }
+        assert!(saw_syntax, "expected at least one Syntax corruption");
+        assert!(saw_eof, "expected at least one Eof corruption");
+        assert!(saw_missing_id, "expected at least one MissingId corruption");
+    }
+
+    #[test]
+    fn test_list_tolerant_surfaces_type_mismatch() {
+        // Valid JSON, has id, but `count` is a string instead of int → TypeMismatch.
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let path = jsonl_path_for(&temp, "test_records");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let mut content = String::new();
+        for i in 0..100 {
+            content.push_str(&format!(
+                "{{\"id\":\"r{}\",\"name\":\"n{}\",\"status\":\"active\",\"count\":{},\"active\":true,\"updated_at\":{}}}\n",
+                i, i, i, 1000 + i
+            ));
+        }
+        // One bad-shape line at line 50 (1-indexed: line 50).
+        let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+        lines[49] = "{\"id\":\"bad\",\"name\":\"x\",\"status\":\"a\",\"count\":\"not-an-int\",\"active\":true,\"updated_at\":5000}".to_string();
+        let combined = lines.join("\n") + "\n";
+        fs::write(&path, combined).unwrap();
+
+        let result: ListResult<TestRecord> = store.list_tolerant(&[]).unwrap();
+        assert_eq!(result.records.len(), 99);
+        assert_eq!(result.corruption.len(), 1);
+        assert_eq!(result.corruption[0].line, 50);
+        match &result.corruption[0].error {
+            CorruptionError::TypeMismatch { .. } => {}
+            other => panic!("expected TypeMismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_list_tolerant_lww_masking_typemismatch() {
+        // line 1: valid record for id X with updated_at=1000
+        // line 2: same id, later updated_at=2000, but `count` is a string → TypeMismatch
+        // Expected: id X surfaces as TypeMismatch corruption with line=2, NOT in records.
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let path = jsonl_path_for(&temp, "test_records");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let content = "{\"id\":\"X\",\"name\":\"old\",\"status\":\"a\",\"count\":1,\"active\":true,\"updated_at\":1000}\n\
+            {\"id\":\"X\",\"name\":\"new\",\"status\":\"a\",\"count\":\"not-an-int\",\"active\":true,\"updated_at\":2000}\n";
+        fs::write(&path, content).unwrap();
+
+        let result: ListResult<TestRecord> = store.list_tolerant(&[]).unwrap();
+        assert!(result.records.is_empty(), "TypeMismatch must mask older valid record");
+        assert_eq!(result.corruption.len(), 1);
+        assert_eq!(result.corruption[0].line, 2);
+        match &result.corruption[0].error {
+            CorruptionError::TypeMismatch { .. } => {}
+            other => panic!("expected TypeMismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_list_tolerant_tombstones_filtered_not_corruption() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+
+        // 5 records, then delete 3 of them (tombstones).
+        store
+            .create_many(vec![
+                make_record("r1", "A", "active", 1, 1000),
+                make_record("r2", "B", "active", 2, 2000),
+                make_record("r3", "C", "active", 3, 3000),
+                make_record("r4", "D", "active", 4, 4000),
+                make_record("r5", "E", "active", 5, 5000),
+            ])
+            .unwrap();
+        store.delete::<TestRecord>("r1").unwrap();
+        store.delete::<TestRecord>("r3").unwrap();
+        store.delete::<TestRecord>("r5").unwrap();
+
+        let result: ListResult<TestRecord> = store.list_tolerant(&[]).unwrap();
+        assert_eq!(result.records.len(), 2);
+        let ids: Vec<&str> = result.records.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"r2"));
+        assert!(ids.contains(&"r4"));
+        // Tombstones are well-formed JSON, so they must NOT appear in corruption.
+        assert!(result.corruption.is_empty());
+    }
+
+    #[test]
+    fn test_list_after_sync_with_syntax_corruption_returns_ok() {
+        // Confirms existing list<T> behavior is preserved: after sync() runs over a
+        // JSONL with syntax-malformed lines, list<T> returns Ok with whatever
+        // survived sync's silent-skip (no new error path introduced by this change).
+        let temp = TempDir::new().unwrap();
+        let path = jsonl_path_for(&temp, "test_records");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let content = "{\"id\":\"r1\",\"name\":\"a\",\"status\":\"x\",\"count\":1,\"active\":true,\"updated_at\":1000}\n\
+            {malformed json}\n\
+            {\"id\":\"r2\",\"name\":\"b\",\"status\":\"x\",\"count\":2,\"active\":true,\"updated_at\":2000}\n";
+        fs::write(&path, content).unwrap();
+
+        // Open the store - this triggers sync() since the JSONL file is unsynced.
+        let mut store = Store::open(temp.path()).unwrap();
+        store.rebuild_indexes::<TestRecord>().unwrap();
+
+        let records: Vec<TestRecord> = store.list(&[]).unwrap();
+        assert_eq!(
+            records.len(),
+            2,
+            "list<T> should return survivors of sync's silent-skip"
+        );
+
+        // list_tolerant on the same data surfaces the corruption.
+        let result: ListResult<TestRecord> = store.list_tolerant(&[]).unwrap();
+        assert_eq!(result.records.len(), 2);
+        assert_eq!(result.corruption.len(), 1);
+    }
+
+    #[test]
+    fn test_list_tolerant_raw_truncation() {
+        // A line longer than 4 KB has its raw truncated and ends with the marker.
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let path = jsonl_path_for(&temp, "test_records");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // Build a malformed line that is much longer than 4 KB.
+        let big = "x".repeat(10_000);
+        let line = format!("{{garbage with embedded huge string: {}}}", big);
+        fs::write(&path, format!("{}\n", line)).unwrap();
+
+        let result: ListResult<TestRecord> = store.list_tolerant(&[]).unwrap();
+        assert_eq!(result.corruption.len(), 1);
+        let entry = &result.corruption[0];
+        assert!(entry.raw.ends_with("...[truncated]"), "raw must end with marker");
+        assert!(entry.raw.len() < line.len(), "raw must be shorter than original");
+    }
+
+    #[test]
+    fn test_list_tolerant_contains_parity_with_list() {
+        // For values where the filter pattern equals the indexed value
+        // (case-insensitively), list<T> (SQL LIKE) and list_tolerant<T>
+        // (in-Rust ASCII-case-insensitive substring) return the same set.
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+
+        store
+            .create_many(vec![
+                make_record("r1", "A", "active", 1, 1000),
+                make_record("r2", "B", "Active", 2, 2000),
+                make_record("r3", "C", "ACTIVE", 3, 3000),
+                make_record("r4", "D", "draft", 4, 4000),
+            ])
+            .unwrap();
+
+        let filters = vec![Filter {
+            field: "status".to_string(),
+            op: FilterOp::Contains,
+            value: IndexValue::String("ACTIVE".to_string()),
+        }];
+
+        let via_list: Vec<TestRecord> = store.list(&filters).unwrap();
+        let via_tolerant: ListResult<TestRecord> = store.list_tolerant(&filters).unwrap();
+
+        let mut a: Vec<String> = via_list.iter().map(|r| r.id.clone()).collect();
+        let mut b: Vec<String> = via_tolerant.records.iter().map(|r| r.id.clone()).collect();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "Contains filter must yield the same set via both methods");
+        assert_eq!(a.len(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_list_tolerant_unreadable_jsonl_returns_err() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+        store.create(make_record("r1", "A", "active", 1, 1000)).unwrap();
+
+        let path = jsonl_path_for(&temp, "test_records");
+        let original = fs::metadata(&path).unwrap().permissions();
+
+        let mut perms = original.clone();
+        perms.set_mode(0o000);
+        fs::set_permissions(&path, perms).unwrap();
+
+        let result: Result<ListResult<TestRecord>> = store.list_tolerant(&[]);
+        // Restore perms so TempDir cleanup works regardless of test outcome.
+        fs::set_permissions(&path, original).unwrap();
+
+        assert!(result.is_err(), "list_tolerant must return Err on unreadable JSONL");
     }
 }

@@ -138,4 +138,129 @@ mod tests {
         assert_eq!(FilterOp::Eq.to_string(), "=");
         assert_eq!(FilterOp::Ne.to_string(), "!=");
     }
+
+    fn fields_str(field: &str, value: &str) -> HashMap<String, IndexValue> {
+        let mut m = HashMap::new();
+        m.insert(field.to_string(), IndexValue::String(value.to_string()));
+        m
+    }
+
+    fn fields_int(field: &str, value: i64) -> HashMap<String, IndexValue> {
+        let mut m = HashMap::new();
+        m.insert(field.to_string(), IndexValue::Int(value));
+        m
+    }
+
+    fn fields_bool(field: &str, value: bool) -> HashMap<String, IndexValue> {
+        let mut m = HashMap::new();
+        m.insert(field.to_string(), IndexValue::Bool(value));
+        m
+    }
+
+    fn filter_str(field: &str, op: FilterOp, value: &str) -> Filter {
+        Filter {
+            field: field.to_string(),
+            op,
+            value: IndexValue::String(value.to_string()),
+        }
+    }
+
+    fn filter_int(field: &str, op: FilterOp, value: i64) -> Filter {
+        Filter {
+            field: field.to_string(),
+            op,
+            value: IndexValue::Int(value),
+        }
+    }
+
+    fn filter_bool(field: &str, op: FilterOp, value: bool) -> Filter {
+        Filter {
+            field: field.to_string(),
+            op,
+            value: IndexValue::Bool(value),
+        }
+    }
+
+    #[test]
+    fn match_filter_string_eq_ne() {
+        let fields = fields_str("status", "active");
+        assert!(match_filter(&fields, &filter_str("status", FilterOp::Eq, "active")));
+        assert!(!match_filter(&fields, &filter_str("status", FilterOp::Eq, "draft")));
+        assert!(match_filter(&fields, &filter_str("status", FilterOp::Ne, "draft")));
+        assert!(!match_filter(&fields, &filter_str("status", FilterOp::Ne, "active")));
+    }
+
+    #[test]
+    fn match_filter_string_ordering() {
+        let fields = fields_str("name", "bravo");
+        assert!(match_filter(&fields, &filter_str("name", FilterOp::Gt, "alpha")));
+        assert!(match_filter(&fields, &filter_str("name", FilterOp::Lt, "charlie")));
+        assert!(match_filter(&fields, &filter_str("name", FilterOp::Gte, "bravo")));
+        assert!(match_filter(&fields, &filter_str("name", FilterOp::Lte, "bravo")));
+        assert!(!match_filter(&fields, &filter_str("name", FilterOp::Gt, "bravo")));
+    }
+
+    #[test]
+    fn match_filter_string_contains_case_insensitive() {
+        let fields = fields_str("status", "Active");
+        // ASCII-case-insensitive substring match (mirrors SQLite LIKE default).
+        assert!(match_filter(
+            &fields,
+            &filter_str("status", FilterOp::Contains, "ACTIVE")
+        ));
+        assert!(match_filter(
+            &fields,
+            &filter_str("status", FilterOp::Contains, "activ")
+        ));
+        assert!(match_filter(&fields, &filter_str("status", FilterOp::Contains, "TIVE")));
+        assert!(!match_filter(
+            &fields,
+            &filter_str("status", FilterOp::Contains, "draft")
+        ));
+    }
+
+    #[test]
+    fn match_filter_int_full() {
+        let fields = fields_int("count", 42);
+        assert!(match_filter(&fields, &filter_int("count", FilterOp::Eq, 42)));
+        assert!(!match_filter(&fields, &filter_int("count", FilterOp::Eq, 43)));
+        assert!(match_filter(&fields, &filter_int("count", FilterOp::Ne, 7)));
+        assert!(match_filter(&fields, &filter_int("count", FilterOp::Gt, 41)));
+        assert!(match_filter(&fields, &filter_int("count", FilterOp::Lt, 43)));
+        assert!(match_filter(&fields, &filter_int("count", FilterOp::Gte, 42)));
+        assert!(match_filter(&fields, &filter_int("count", FilterOp::Lte, 42)));
+        assert!(!match_filter(&fields, &filter_int("count", FilterOp::Contains, 42)));
+    }
+
+    #[test]
+    fn match_filter_bool_full() {
+        let fields = fields_bool("active", true);
+        assert!(match_filter(&fields, &filter_bool("active", FilterOp::Eq, true)));
+        assert!(!match_filter(&fields, &filter_bool("active", FilterOp::Eq, false)));
+        assert!(match_filter(&fields, &filter_bool("active", FilterOp::Ne, false)));
+        assert!(match_filter(&fields, &filter_bool("active", FilterOp::Gt, false)));
+        assert!(!match_filter(&fields, &filter_bool("active", FilterOp::Gt, true)));
+        assert!(match_filter(&fields, &filter_bool("active", FilterOp::Gte, true)));
+        assert!(!match_filter(&fields, &filter_bool("active", FilterOp::Contains, true)));
+    }
+
+    #[test]
+    fn match_filter_missing_field_is_false() {
+        // Mirrors SQL's EXISTS subquery returning empty when the indexed field is absent.
+        let fields = fields_str("status", "active");
+        assert!(!match_filter(&fields, &filter_str("missing", FilterOp::Eq, "x")));
+    }
+
+    #[test]
+    fn match_filter_type_mismatch_is_false() {
+        // Mirrors SQL keying off field_value_str / _int / _bool typed columns.
+        let fields = fields_str("count", "forty-two");
+        assert!(!match_filter(&fields, &filter_int("count", FilterOp::Eq, 42)));
+
+        let fields = fields_int("status", 1);
+        assert!(!match_filter(&fields, &filter_str("status", FilterOp::Eq, "1")));
+
+        let fields = fields_bool("flag", true);
+        assert!(!match_filter(&fields, &filter_int("flag", FilterOp::Eq, 1)));
+    }
 }
